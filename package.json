@@ -4,23 +4,35 @@
   "description": "ClawdBot skill to control Claude Code via MCP",
   "type": "module",
   "bin": {
-    "claude-code-skill": "./dist/index.js"
+    "claude-code-skill": "./dist/index.js",
+    "claude-code-server": "./dist/server.js"
   },
   "main": "./dist/index.js",
   "scripts": {
     "build": "tsc",
     "dev": "tsx src/index.ts",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "start:server": "node dist/server.js"
   },
   "engines": {
     "node": ">=18.0.0"
   },
-  "keywords": ["claude", "claude-code", "mcp", "openclaw", "skill"],
+  "keywords": [
+    "claude",
+    "claude-code",
+    "mcp",
+    "openclaw",
+    "skill"
+  ],
   "author": "enderfga",
   "license": "MIT",
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.26.0",
     "commander": "^12.1.0",
-    "node-fetch": "^3.3.2"
+    "idb-keyval": "^6.2.2",
+    "node-fetch": "^3.3.2",
+    "zod": "^3.25.76",
+    "zustand": "^5.0.11"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
