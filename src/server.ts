@@ -6,7 +6,7 @@
  */
 
 import http from 'node:http';
-import { spawn, exec, type ChildProcess } from 'node:child_process';
+import { spawn, exec, execSync, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -476,10 +476,9 @@ function expandGlobs(patterns: string[], basePath: string): string[] {
       continue;
     }
     try {
-      const result = require('node:child_process')
-        .execSync(`bash -O globstar -c 'for f in ${pattern}; do [ -f "$f" ] && echo "$f"; done'`, {
+      const result = execSync(`bash -c 'shopt -s globstar 2>/dev/null; for f in ${pattern}; do [ -f "$f" ] && echo "$f"; done'`, {
           cwd: basePath,
-          encoding: 'utf-8' as BufferEncoding,
+          encoding: 'utf-8',
           timeout: 10_000,
           maxBuffer: 5 * 1024 * 1024,
         }) as string;
