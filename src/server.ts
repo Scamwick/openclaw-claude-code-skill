@@ -2,7 +2,7 @@
 /**
  * Backend API server for claude-code-skill CLI.
  * Spawns `claude` CLI processes to fulfill requests.
- * In-memory session store for persistent sessions.
+ * Disk-backed session store for persistent sessions (via SessionStore).
  */
 
 import http from 'node:http';
@@ -11,6 +11,127 @@ import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { readdir, readFile, stat } from 'node:fs/promises';
+import { SessionStore } from './session-store.js';
+import type { SessionConfig, SessionStats, HistoryEntry } from './session-store.js';
+
+// ─── Security: Rate Limiting ────────────────────────────────────────────────
+
+interface RateLimitBucket {
+  count: number;
+  resetAt: number;
+}
+
+const rateLimitStore = new Map<string, RateLimitBucket>();
+
+const rateLimitCleanupInterval = setInterval(() => {
+  const now = Date.now();
+  for (const [key, bucket] of rateLimitStore) {
+    if (bucket.resetAt <= now) rateLimitStore.delete(key);
+  }
+}, 60_000);
+rateLimitCleanupInterval.unref();
+
+type RateLimitGroup = 'read' | 'write' | 'spawn';
+
+const RATE_LIMITS: Record<RateLimitGroup, number> = {
+  read: parseInt(process.env.RATE_LIMIT_READ || '120'),    // 120 req/min for read-only endpoints
+  write: parseInt(process.env.RATE_LIMIT_WRITE || '60'),   // 60 req/min for write/bash endpoints
+  spawn: parseInt(process.env.RATE_LIMIT_SPAWN || '20'),   // 20 req/min for claude spawn endpoints
+};
+
+function checkRateLimit(ip: string, group: RateLimitGroup): boolean {
+  const maxRequests = RATE_LIMITS[group];
+  const now = Date.now();
+  const key = `${ip}:${group}`;
+  const bucket = rateLimitStore.get(key);
+
+  if (!bucket || bucket.resetAt <= now) {
+    rateLimitStore.set(key, { count: 1, resetAt: now + 60_000 });
+    return true;
+  }
+
+  bucket.count++;
+  return bucket.count <= maxRequests;
+}
+
+function getClientIp(req: http.IncomingMessage): string {
+  const forwarded = req.headers['x-forwarded-for'];
+  if (typeof forwarded === 'string') return forwarded.split(',')[0].trim();
+  return req.socket.remoteAddress || '127.0.0.1';
+}
+
+const endpointRateLimitGroup: Record<string, RateLimitGroup> = {
+  '/connect': 'read',
+  '/disconnect': 'write',
+  '/tools': 'read',
+  '/bash': 'write',
+  '/read': 'read',
+  '/call': 'spawn',
+  '/sessions': 'read',
+  '/batch-read': 'read',
+  '/resume': 'spawn',
+  '/continue': 'spawn',
+  '/session/start': 'write',
+  '/session/send': 'spawn',
+  '/session/send-stream': 'spawn',
+  '/session/list': 'read',
+  '/session/stop': 'write',
+  '/session/status': 'read',
+  '/session/history': 'read',
+  '/session/pause': 'write',
+  '/session/resume': 'write',
+  '/session/fork': 'write',
+  '/session/search': 'read',
+  '/session/restart': 'write',
+};
+
+// ─── Security: Input Validation ─────────────────────────────────────────────
+
+const SESSION_NAME_RE = /^[a-zA-Z0-9_-]{1,128}$/;
+const MAX_COMMAND_LENGTH = 10_000;
+const MAX_MESSAGE_LENGTH = 100_000;
+const MAX_PATH_LENGTH = 4096;
+
+/** Shell metacharacters that enable command injection */
+const DANGEROUS_SHELL_CHARS = /[;|&`$(){}!#<>\n\r]/;
+
+function isValidSessionName(name: unknown): name is string {
+  return typeof name === 'string' && SESSION_NAME_RE.test(name);
+}
+
+function validateString(
+  value: unknown,
+  fieldName: string,
+  maxLength: number,
+): { valid: true; value: string } | { valid: false; error: string } {
+  if (typeof value !== 'string' || value.length === 0) {
+    return { valid: false, error: `Missing or empty required field: ${fieldName}` };
+  }
+  if (value.length > maxLength) {
+    return { valid: false, error: `${fieldName} exceeds maximum length of ${maxLength}` };
+  }
+  return { valid: true, value };
+}
+
+function validateFilePath(
+  filePath: unknown,
+  allowedBases?: string[],
+): { valid: true; resolved: string } | { valid: false; error: string } {
+  if (typeof filePath !== 'string' || filePath.length === 0) {
+    return { valid: false, error: 'Missing or empty file_path' };
+  }
+  if (filePath.length > MAX_PATH_LENGTH) {
+    return { valid: false, error: `file_path exceeds maximum length of ${MAX_PATH_LENGTH}` };
+  }
+  const resolved = path.resolve(filePath);
+  if (allowedBases && allowedBases.length > 0) {
+    const isAllowed = allowedBases.some((base) => resolved.startsWith(path.resolve(base)));
+    if (!isAllowed) {
+      return { valid: false, error: 'Access denied: path is outside allowed directories' };
+    }
+  }
+  return { valid: true, resolved };
+}
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -19,6 +140,11 @@ const HOST = process.env.CLAUDE_CODE_HOST || '127.0.0.1';
 const PREFIX = '/backend-api/claude-code';
 const HOME = process.env.HOME || '/tmp';
 const CLAUDE_HOME = path.join(HOME, '.claude');
+
+/** Comma-separated allowed directories for /read and /batch-read. Unset = allow all resolved paths. */
+const ALLOWED_READ_DIRS: string[] | undefined = process.env.ALLOWED_READ_DIRS
+  ? process.env.ALLOWED_READ_DIRS.split(',').map((d) => d.trim())
+  : undefined;
 
 function findClaudeBin(): string {
   const candidates = [
@@ -38,50 +164,7 @@ function findClaudeBin(): string {
 const CLAUDE_BIN = findClaudeBin();
 
 // ─── Types ───────────────────────────────────────────────────────────────────
-
-interface SessionConfig {
-  name: string;
-  claudeSessionId: string;
-  cwd: string;
-  created: string;
-  model?: string;
-  baseUrl?: string;
-  permissionMode: string;
-  allowedTools?: string[];
-  disallowedTools?: string[];
-  tools?: string[];
-  maxTurns?: number;
-  maxBudgetUsd?: number;
-  systemPrompt?: string;
-  appendSystemPrompt?: string;
-  dangerouslySkipPermissions?: boolean;
-  agents?: Record<string, { description?: string; prompt?: string }>;
-  agent?: string;
-  addDir?: string[];
-  paused: boolean;
-  stats: SessionStats;
-  history: HistoryEntry[];
-  activeProcess: ChildProcess | null;
-}
-
-interface SessionStats {
-  turns: number;
-  toolCalls: number;
-  tokensIn: number;
-  tokensOut: number;
-  startTime: number;
-  lastActivity: string;
-}
-
-interface HistoryEntry {
-  time: string;
-  type: string;
-  event: {
-    message?: {
-      content?: Array<{ type: string; text?: string; name?: string }>;
-    };
-  };
-}
+// SessionConfig, SessionStats, and HistoryEntry are imported from ./session-store.js
 
 interface ClaudeResult {
   type?: string;
@@ -102,8 +185,31 @@ type RouteHandler = (
 
 // ─── State ───────────────────────────────────────────────────────────────────
 
-const sessions = new Map<string, SessionConfig>();
+const sessions = new SessionStore();
 let connected = false;
+
+// Track all spawned child processes for zombie cleanup
+const trackedProcesses = new Set<ChildProcess>();
+let inFlightRequests = 0;
+let isShuttingDown = false;
+
+function trackProcess(proc: ChildProcess): void {
+  trackedProcesses.add(proc);
+  const cleanup = () => { trackedProcesses.delete(proc); };
+  proc.on('exit', cleanup);
+  proc.on('error', cleanup);
+  proc.on('close', cleanup);
+}
+
+// Periodic zombie process cleanup — every 60s, remove dead processes from the set
+const zombieCleanupInterval = setInterval(() => {
+  for (const proc of trackedProcesses) {
+    if (proc.killed || proc.exitCode !== null || proc.signalCode !== null) {
+      trackedProcesses.delete(proc);
+    }
+  }
+}, 60_000);
+zombieCleanupInterval.unref(); // Don't keep the event loop alive just for this
 
 const KNOWN_TOOLS = [
   { name: 'Bash', description: 'Execute bash commands' },
@@ -135,20 +241,59 @@ function sendJson(res: http.ServerResponse, status: number, data: object): void 
   res.end(body);
 }
 
+const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB
+const REQUEST_TIMEOUT_MS = 30_000; // 30s default
+
+class BodyTooLargeError extends Error {
+  constructor(size: number) {
+    super(`Request body too large: ${size} bytes exceeds ${MAX_BODY_SIZE} byte limit`);
+    this.name = 'BodyTooLargeError';
+  }
+}
+
+class MalformedJsonError extends Error {
+  constructor(parseError: string) {
+    super(`Malformed JSON in request body: ${parseError}`);
+    this.name = 'MalformedJsonError';
+  }
+}
+
 function readBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on('data', (chunk: Buffer) => chunks.push(chunk));
+    let totalSize = 0;
+
+    const timeout = setTimeout(() => {
+      req.destroy(new Error('Request body read timed out'));
+      reject(new Error('Request body read timed out'));
+    }, REQUEST_TIMEOUT_MS);
+
+    req.on('data', (chunk: Buffer) => {
+      totalSize += chunk.length;
+      if (totalSize > MAX_BODY_SIZE) {
+        req.destroy();
+        clearTimeout(timeout);
+        reject(new BodyTooLargeError(totalSize));
+        return;
+      }
+      chunks.push(chunk);
+    });
+
     req.on('end', () => {
+      clearTimeout(timeout);
       const raw = Buffer.concat(chunks).toString();
       if (!raw) return resolve({});
       try {
         resolve(JSON.parse(raw));
-      } catch {
-        resolve({});
+      } catch (err) {
+        reject(new MalformedJsonError((err as Error).message));
       }
     });
-    req.on('error', reject);
+
+    req.on('error', (err) => {
+      clearTimeout(timeout);
+      reject(err);
+    });
   });
 }
 
@@ -212,11 +357,22 @@ function sessionClaudeOpts(s: SessionConfig): {
   };
 }
 
+/** Map exit codes to human-readable error categories */
+function classifyExitCode(code: number): string {
+  switch (code) {
+    case 0: return 'success';
+    case 1: return 'runtime_error';
+    case 2: return 'usage_error';
+    case -1: return 'process_failure';
+    default: return `unknown_error_${code}`;
+  }
+}
+
 function runClaude(
   prompt: string,
   cwd: string,
   opts: Parameters<typeof buildClaudeArgs>[1] & { timeout?: number },
-): Promise<{ parsed: ClaudeResult | null; stdout: string; stderr: string; code: number }> {
+): Promise<{ parsed: ClaudeResult | null; stdout: string; stderr: string; code: number; errorCategory?: string }> {
   return new Promise((resolve) => {
     const args = buildClaudeArgs(prompt, opts);
     const proc = spawn(CLAUDE_BIN, args, {
@@ -225,30 +381,67 @@ function runClaude(
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
+    // Track the process for zombie cleanup
+    trackProcess(proc);
+
     let stdout = '';
     let stderr = '';
+    const MAX_OUTPUT = 50 * 1024 * 1024; // 50MB max output buffer
 
-    proc.stdout!.on('data', (d: Buffer) => { stdout += d.toString(); });
-    proc.stderr!.on('data', (d: Buffer) => { stderr += d.toString(); });
+    proc.stdout!.on('data', (d: Buffer) => {
+      if (stdout.length < MAX_OUTPUT) stdout += d.toString();
+    });
+    proc.stderr!.on('data', (d: Buffer) => {
+      if (stderr.length < MAX_OUTPUT) stderr += d.toString();
+    });
 
-    const timeout = opts.timeout || 120_000;
+    const timeout = Math.min(opts.timeout || 120_000, 300_000); // cap at 5 minutes
     const timer = setTimeout(() => {
       proc.kill('SIGTERM');
-      resolve({ parsed: null, stdout, stderr: stderr + '\nProcess timed out', code: -1 });
+      // Give it 3s to terminate gracefully, then SIGKILL
+      setTimeout(() => {
+        if (!proc.killed) proc.kill('SIGKILL');
+      }, 3000);
+      resolve({
+        parsed: null,
+        stdout,
+        stderr: stderr + '\nProcess timed out after ' + timeout + 'ms',
+        code: -1,
+        errorCategory: 'timeout',
+      });
     }, timeout);
 
     proc.on('close', (code) => {
       clearTimeout(timer);
+      const exitCode = code ?? -1;
       let parsed: ClaudeResult | null = null;
       try {
         parsed = JSON.parse(stdout) as ClaudeResult;
       } catch { /* not valid JSON */ }
-      resolve({ parsed, stdout, stderr, code: code ?? -1 });
+
+      if (exitCode !== 0 && !parsed) {
+        // Non-zero exit with no parseable output — return structured error
+        resolve({
+          parsed: null,
+          stdout,
+          stderr,
+          code: exitCode,
+          errorCategory: classifyExitCode(exitCode),
+        });
+      } else {
+        resolve({ parsed, stdout, stderr, code: exitCode });
+      }
     });
 
     proc.on('error', (err) => {
       clearTimeout(timer);
-      resolve({ parsed: null, stdout, stderr: err.message, code: -1 });
+      resolve({
+        parsed: null,
+        stdout,
+        stderr: `Process spawn error: ${err.message}`,
+        code: -1,
+        errorCategory: 'spawn_error',
+      });
     });
 
     proc.stdin!.end();
@@ -258,10 +451,10 @@ function runClaude(
 function execCommand(
   command: string,
   cwd?: string,
-  timeout = 60_000,
+  timeout = 30_000,
 ): Promise<{ stdout: string; stderr: string; code: number }> {
   return new Promise((resolve) => {
-    exec(command, { cwd: cwd || process.cwd(), timeout, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+    exec(command, { cwd: cwd || process.cwd(), timeout, maxBuffer: 5 * 1024 * 1024, shell: '/bin/bash' }, (err, stdout, stderr) => {
       resolve({
         stdout: stdout || '',
         stderr: stderr || '',
@@ -271,15 +464,24 @@ function execCommand(
   });
 }
 
+/** Safe glob pattern: alphanumeric, slashes, dots, asterisks, question marks, brackets, hyphens, underscores */
+const SAFE_GLOB_RE = /^[a-zA-Z0-9\/.* ?[\]_-]+$/;
+
 function expandGlobs(patterns: string[], basePath: string): string[] {
   const files: string[] = [];
   for (const pattern of patterns) {
+    // Reject patterns with shell metacharacters to prevent command injection
+    if (!SAFE_GLOB_RE.test(pattern)) {
+      console.warn(`[SECURITY] Rejected unsafe glob pattern: ${pattern.substring(0, 100)}`);
+      continue;
+    }
     try {
       const result = require('node:child_process')
         .execSync(`bash -O globstar -c 'for f in ${pattern}; do [ -f "$f" ] && echo "$f"; done'`, {
           cwd: basePath,
           encoding: 'utf-8' as BufferEncoding,
           timeout: 10_000,
+          maxBuffer: 5 * 1024 * 1024,
         }) as string;
       for (const f of result.trim().split('\n')) {
         if (f) files.push(path.resolve(basePath, f));
@@ -344,20 +546,29 @@ const handleTools: RouteHandler = async (_req, res) => {
 
 // POST /bash
 const handleBash: RouteHandler = async (_req, res, body) => {
-  const command = body.command as string;
-  if (!command) return sendJson(res, 200, { ok: false, error: 'Missing command' });
+  const cmdCheck = validateString(body.command, 'command', MAX_COMMAND_LENGTH);
+  if (!cmdCheck.valid) return sendJson(res, 400, { ok: false, error: cmdCheck.error });
+  const command = cmdCheck.value;
 
-  const { stdout, stderr } = await execCommand(command);
+  // Block dangerous shell metacharacters to prevent command injection
+  if (DANGEROUS_SHELL_CHARS.test(command)) {
+    return sendJson(res, 400, {
+      ok: false,
+      error: 'Command contains disallowed shell metacharacters (;|&`$(){}!#<>). Use individual commands instead.',
+    });
+  }
+
+  const { stdout, stderr } = await execCommand(command, undefined, 30_000);
   sendJson(res, 200, { ok: true, result: { stdout, stderr } });
 };
 
 // POST /read
 const handleRead: RouteHandler = async (_req, res, body) => {
-  const filePath = body.file_path as string;
-  if (!filePath) return sendJson(res, 200, { ok: false, error: 'Missing file_path' });
+  const pathCheck = validateFilePath(body.file_path, ALLOWED_READ_DIRS);
+  if (!pathCheck.valid) return sendJson(res, 400, { ok: false, error: pathCheck.error });
 
   try {
-    const content = await readFile(filePath, 'utf-8');
+    const content = await readFile(pathCheck.resolved, 'utf-8');
     sendJson(res, 200, { ok: true, result: { type: 'file', file: { content } } });
   } catch (err) {
     sendJson(res, 200, { ok: false, error: (err as Error).message });
@@ -366,12 +577,13 @@ const handleRead: RouteHandler = async (_req, res, body) => {
 
 // POST /call
 const handleCall: RouteHandler = async (_req, res, body) => {
-  const tool = body.tool as string;
+  const toolCheck = validateString(body.tool, 'tool', 100);
+  if (!toolCheck.valid) return sendJson(res, 400, { ok: false, error: toolCheck.error });
+  const tool = toolCheck.value;
   const args = body.args as Record<string, unknown> || {};
-  if (!tool) return sendJson(res, 200, { ok: false, error: 'Missing tool' });
 
   const prompt = `Use the ${tool} tool with these exact arguments: ${JSON.stringify(args)}. Return only the tool output, nothing else.`;
-  const { parsed, stderr } = await runClaude(prompt, process.cwd(), {
+  const { parsed, stderr, code, errorCategory } = await runClaude(prompt, process.cwd(), {
     permissionMode: 'bypassPermissions',
     outputFormat: 'json',
   });
@@ -384,7 +596,13 @@ const handleCall: RouteHandler = async (_req, res, body) => {
     } catch { /* keep as string */ }
     sendJson(res, 200, { ok: true, result });
   } else {
-    sendJson(res, 200, { ok: false, error: stderr || 'Claude invocation failed' });
+    sendJson(res, 200, {
+      ok: false,
+      error: stderr || 'Claude invocation failed',
+      exitCode: code,
+      errorCategory,
+      stderr: stderr || undefined,
+    });
   }
 };
 
@@ -462,8 +680,14 @@ const handleBatchRead: RouteHandler = async (_req, res, body) => {
   const basePath = (body.basePath as string) || process.cwd();
 
   if (!Array.isArray(patterns) || patterns.length === 0) {
-    return sendJson(res, 200, { ok: false, error: 'Missing patterns array' });
+    return sendJson(res, 400, { ok: false, error: 'Missing patterns array' });
   }
+  if (patterns.length > 50) {
+    return sendJson(res, 400, { ok: false, error: 'Too many patterns (max 50)' });
+  }
+  // Validate basePath
+  const bpCheck = validateFilePath(basePath, ALLOWED_READ_DIRS);
+  if (!bpCheck.valid) return sendJson(res, 400, { ok: false, error: bpCheck.error });
 
   const filePaths = expandGlobs(patterns, basePath);
   const files: Array<{ path: string; content: string; error?: string }> = [];
@@ -482,15 +706,16 @@ const handleBatchRead: RouteHandler = async (_req, res, body) => {
 
 // POST /resume
 const handleResume: RouteHandler = async (_req, res, body) => {
-  const sessionId = body.sessionId as string;
-  const prompt = body.prompt as string;
+  const sidCheck = validateString(body.sessionId, 'sessionId', 256);
+  if (!sidCheck.valid) return sendJson(res, 400, { ok: false, error: sidCheck.error });
+  const promptCheck = validateString(body.prompt, 'prompt', MAX_MESSAGE_LENGTH);
+  if (!promptCheck.valid) return sendJson(res, 400, { ok: false, error: promptCheck.error });
+
+  const sessionId = sidCheck.value;
+  const prompt = promptCheck.value;
   const cwd = (body.cwd as string) || process.cwd();
 
-  if (!sessionId || !prompt) {
-    return sendJson(res, 200, { ok: false, error: 'Missing sessionId or prompt' });
-  }
-
-  const { parsed, stderr } = await runClaude(prompt, cwd, {
+  const { parsed, stderr, code, errorCategory } = await runClaude(prompt, cwd, {
     sessionId,
     outputFormat: 'json',
   });
@@ -498,18 +723,25 @@ const handleResume: RouteHandler = async (_req, res, body) => {
   if (parsed) {
     sendJson(res, 200, { ok: true, output: parsed.result || '', stderr });
   } else {
-    sendJson(res, 200, { ok: false, error: stderr || 'Claude invocation failed' });
+    sendJson(res, 200, {
+      ok: false,
+      error: stderr || 'Claude invocation failed',
+      exitCode: code,
+      errorCategory,
+      stderr: stderr || undefined,
+    });
   }
 };
 
 // POST /continue
 const handleContinue: RouteHandler = async (_req, res, body) => {
-  const prompt = body.prompt as string;
+  const promptCheck = validateString(body.prompt, 'prompt', MAX_MESSAGE_LENGTH);
+  if (!promptCheck.valid) return sendJson(res, 400, { ok: false, error: promptCheck.error });
+
+  const prompt = promptCheck.value;
   const cwd = (body.cwd as string) || process.cwd();
 
-  if (!prompt) return sendJson(res, 200, { ok: false, error: 'Missing prompt' });
-
-  const { parsed, stderr } = await runClaude(prompt, cwd, {
+  const { parsed, stderr, code, errorCategory } = await runClaude(prompt, cwd, {
     continueSession: true,
     outputFormat: 'json',
   });
@@ -517,14 +749,22 @@ const handleContinue: RouteHandler = async (_req, res, body) => {
   if (parsed) {
     sendJson(res, 200, { ok: true, output: parsed.result || '', stderr });
   } else {
-    sendJson(res, 200, { ok: false, error: stderr || 'Claude invocation failed' });
+    sendJson(res, 200, {
+      ok: false,
+      error: stderr || 'Claude invocation failed',
+      exitCode: code,
+      errorCategory,
+      stderr: stderr || undefined,
+    });
   }
 };
 
 // POST /session/start
 const handleSessionStart: RouteHandler = async (_req, res, body) => {
+  if (!isValidSessionName(body.name)) {
+    return sendJson(res, 400, { ok: false, error: 'Invalid session name. Must be 1-128 chars: alphanumeric, hyphens, underscores only.' });
+  }
   const name = body.name as string;
-  if (!name) return sendJson(res, 200, { ok: false, error: 'Missing name' });
 
   if (sessions.has(name)) {
     return sendJson(res, 200, { ok: false, error: `Session '${name}' already exists` });
@@ -564,13 +804,15 @@ const handleSessionStart: RouteHandler = async (_req, res, body) => {
 
 // POST /session/send
 const handleSessionSend: RouteHandler = async (_req, res, body) => {
-  const name = body.name as string;
-  const message = body.message as string;
-  const timeout = (body.timeout as number) || 120_000;
-
-  if (!name || !message) {
-    return sendJson(res, 200, { ok: false, error: 'Missing name or message' });
+  if (!isValidSessionName(body.name)) {
+    return sendJson(res, 400, { ok: false, error: 'Invalid session name' });
   }
+  const msgCheck = validateString(body.message, 'message', MAX_MESSAGE_LENGTH);
+  if (!msgCheck.valid) return sendJson(res, 400, { ok: false, error: msgCheck.error });
+
+  const name = body.name as string;
+  const message = msgCheck.value;
+  const timeout = Math.min((body.timeout as number) || 120_000, 300_000); // cap at 5 min
 
   const session = sessions.get(name);
   if (!session) return sendJson(res, 200, { ok: false, error: `Session '${name}' not found` });
@@ -584,7 +826,7 @@ const handleSessionSend: RouteHandler = async (_req, res, body) => {
   });
 
   const opts = sessionClaudeOpts(session);
-  const { parsed, stderr } = await runClaude(message, session.cwd, {
+  const { parsed, stderr, code, errorCategory } = await runClaude(message, session.cwd, {
     ...opts,
     outputFormat: 'json',
     timeout,
@@ -603,21 +845,30 @@ const handleSessionSend: RouteHandler = async (_req, res, body) => {
       event: { message: { content: [{ type: 'text', text: parsed.result || '' }] } },
     });
 
+    sessions.markDirty();
     sendJson(res, 200, { ok: true, response: parsed.result || '' });
   } else {
-    sendJson(res, 200, { ok: false, error: stderr || 'Claude invocation failed' });
+    sendJson(res, 200, {
+      ok: false,
+      error: stderr || 'Claude invocation failed',
+      exitCode: code,
+      errorCategory,
+      stderr: stderr || undefined,
+    });
   }
 };
 
 // POST /session/send-stream
-const handleSessionSendStream: RouteHandler = async (_req, res, body) => {
-  const name = body.name as string;
-  const message = body.message as string;
-  const timeout = (body.timeout as number) || 120_000;
-
-  if (!name || !message) {
-    return sendJson(res, 200, { ok: false, error: 'Missing name or message' });
+const handleSessionSendStream: RouteHandler = async (req, res, body) => {
+  if (!isValidSessionName(body.name)) {
+    return sendJson(res, 400, { ok: false, error: 'Invalid session name' });
   }
+  const msgCheck = validateString(body.message, 'message', MAX_MESSAGE_LENGTH);
+  if (!msgCheck.valid) return sendJson(res, 400, { ok: false, error: msgCheck.error });
+
+  const name = body.name as string;
+  const message = msgCheck.value;
+  const timeout = Math.min((body.timeout as number) || 120_000, 300_000); // cap at 5 min
 
   const session = sessions.get(name);
   if (!session) return sendJson(res, 200, { ok: false, error: `Session '${name}' not found` });
@@ -630,13 +881,46 @@ const handleSessionSendStream: RouteHandler = async (_req, res, body) => {
     event: { message: { content: [{ type: 'text', text: message }] } },
   });
 
-  // Set up SSE headers
+  // Set up SSE headers (including nginx proxy buffering bypass)
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
     'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
     'Access-Control-Allow-Origin': '*',
   });
+
+  // Send retry directive so clients reconnect after 3s on disconnect
+  res.write('retry: 3000\n\n');
+
+  // Incrementing event ID for client reconnection (Last-Event-ID support)
+  let eventId = 0;
+
+  // Track whether the stream has been cleaned up to avoid double-cleanup
+  let cleaned = false;
+
+  function writeSSE(event: string, data: object): void {
+    if (cleaned) return;
+    eventId++;
+    res.write(`id: ${eventId}\nevent: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  }
+
+  // Send initial status
+  writeSSE('status', { status: 'thinking' });
+
+  // Heartbeat to prevent proxy/load balancer timeouts (every 15s)
+  const heartbeatInterval = setInterval(() => {
+    if (cleaned) return;
+    res.write(': heartbeat\n\n');
+  }, 15_000);
+
+  function cleanup(): void {
+    if (cleaned) return;
+    cleaned = true;
+    clearInterval(heartbeatInterval);
+    clearTimeout(timer);
+    session!.activeProcess = null;
+  }
 
   const opts = sessionClaudeOpts(session);
   const args = buildClaudeArgs(message, { ...opts, outputFormat: 'stream-json' });
@@ -647,11 +931,14 @@ const handleSessionSendStream: RouteHandler = async (_req, res, body) => {
     stdio: ['pipe', 'pipe', 'pipe'],
   });
 
+  // Track the process for zombie cleanup
+  trackProcess(proc);
   session.activeProcess = proc;
 
   const timer = setTimeout(() => {
     proc.kill('SIGTERM');
-    res.write(`data: ${JSON.stringify({ type: 'error', error: 'Process timed out' })}\n\n`);
+    writeSSE('error', { type: 'error', error: 'Process timed out' });
+    cleanup();
     res.end();
   }, timeout);
 
@@ -659,6 +946,7 @@ const handleSessionSendStream: RouteHandler = async (_req, res, body) => {
   let fullText = '';
 
   proc.stdout!.on('data', (chunk: Buffer) => {
+    if (cleaned) return;
     buffer += chunk.toString();
     const lines = buffer.split('\n');
     buffer = lines.pop() || '';
@@ -667,7 +955,7 @@ const handleSessionSendStream: RouteHandler = async (_req, res, body) => {
       if (!line.trim()) continue;
       try {
         const evt = JSON.parse(line);
-        processStreamEvent(evt, res, session, (text) => { fullText += text; });
+        processStreamEvent(evt, session, writeSSE, (text) => { fullText += text; });
       } catch { /* skip malformed lines */ }
     }
   });
@@ -675,19 +963,16 @@ const handleSessionSendStream: RouteHandler = async (_req, res, body) => {
   proc.stderr!.on('data', (chunk: Buffer) => {
     const text = chunk.toString().trim();
     if (text) {
-      res.write(`data: ${JSON.stringify({ type: 'error', error: text })}\n\n`);
+      writeSSE('error', { type: 'error', error: text });
     }
   });
 
   proc.on('close', () => {
-    clearTimeout(timer);
-    session.activeProcess = null;
-
-    // Process any remaining buffer
-    if (buffer.trim()) {
+    // Process any remaining buffer before cleanup
+    if (buffer.trim() && !cleaned) {
       try {
         const evt = JSON.parse(buffer);
-        processStreamEvent(evt, res, session, (text) => { fullText += text; });
+        processStreamEvent(evt, session, writeSSE, (text) => { fullText += text; });
       } catch { /* ignore */ }
     }
 
@@ -700,30 +985,36 @@ const handleSessionSendStream: RouteHandler = async (_req, res, body) => {
       });
     }
 
-    res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
+    sessions.markDirty();
+    writeSSE('done', {});
+    cleanup();
     res.end();
   });
 
   proc.on('error', (err) => {
-    clearTimeout(timer);
-    session.activeProcess = null;
-    res.write(`data: ${JSON.stringify({ type: 'error', error: err.message })}\n\n`);
+    writeSSE('error', { type: 'error', error: err.message });
+    cleanup();
     res.end();
   });
 
   proc.stdin!.end();
 
-  // Handle client disconnect
-  res.on('close', () => {
-    clearTimeout(timer);
-    if (!proc.killed) proc.kill('SIGTERM');
+  // Handle client disconnect — kill child process and clean up
+  req.on('close', () => {
+    if (!proc.killed) {
+      proc.kill('SIGTERM');
+    }
+    cleanup();
   });
 };
 
+/** SSE write function type used by processStreamEvent */
+type SSEWriter = (event: string, data: object) => void;
+
 function processStreamEvent(
   evt: Record<string, unknown>,
-  res: http.ServerResponse,
   session: SessionConfig,
+  writeSSE: SSEWriter,
   collectText: (text: string) => void,
 ): void {
   const type = evt.type as string;
@@ -732,17 +1023,18 @@ function processStreamEvent(
     const block = evt.content_block as Record<string, unknown> | undefined;
     if (block?.type === 'tool_use') {
       session.stats.toolCalls++;
-      res.write(`data: ${JSON.stringify({ type: 'tool_use', tool: block.name })}\n\n`);
+      writeSSE('message', { type: 'tool_use', tool: block.name });
     }
   } else if (type === 'content_block_delta') {
     const delta = evt.delta as Record<string, unknown> | undefined;
     if (delta?.type === 'text_delta' && delta.text) {
       const text = delta.text as string;
       collectText(text);
-      res.write(`data: ${JSON.stringify({ type: 'text', text })}\n\n`);
+      writeSSE('message', { type: 'text', text });
     }
   } else if (type === 'assistant') {
     // Full message event — extract text and tool_use blocks
+    writeSSE('status', { status: 'responding' });
     const msg = evt.message as Record<string, unknown> | undefined;
     const content = msg?.content as Array<Record<string, unknown>> | undefined;
     if (content) {
@@ -750,15 +1042,15 @@ function processStreamEvent(
         if (block.type === 'text' && block.text) {
           const text = block.text as string;
           collectText(text);
-          res.write(`data: ${JSON.stringify({ type: 'text', text })}\n\n`);
+          writeSSE('message', { type: 'text', text });
         } else if (block.type === 'tool_use') {
           session.stats.toolCalls++;
-          res.write(`data: ${JSON.stringify({ type: 'tool_use', tool: block.name })}\n\n`);
+          writeSSE('message', { type: 'tool_use', tool: block.name });
         }
       }
     }
   } else if (type === 'tool') {
-    res.write(`data: ${JSON.stringify({ type: 'tool_result' })}\n\n`);
+    writeSSE('message', { type: 'tool_result' });
   } else if (type === 'result') {
     // Final result event
     const result = evt as ClaudeResult;
@@ -854,6 +1146,7 @@ const handleSessionPause: RouteHandler = async (_req, res, body) => {
     s.activeProcess.kill('SIGTERM');
     s.activeProcess = null;
   }
+  sessions.markDirty();
   sendJson(res, 200, { ok: true });
 };
 
@@ -866,14 +1159,17 @@ const handleSessionResume: RouteHandler = async (_req, res, body) => {
   if (!s) return sendJson(res, 200, { ok: false, error: `Session '${name}' not found` });
 
   s.paused = false;
+  sessions.markDirty();
   sendJson(res, 200, { ok: true });
 };
 
 // POST /session/fork
 const handleSessionFork: RouteHandler = async (_req, res, body) => {
+  if (!isValidSessionName(body.name) || !isValidSessionName(body.newName)) {
+    return sendJson(res, 400, { ok: false, error: 'Invalid session name. Must be 1-128 chars: alphanumeric, hyphens, underscores only.' });
+  }
   const name = body.name as string;
   const newName = body.newName as string;
-  if (!name || !newName) return sendJson(res, 200, { ok: false, error: 'Missing name or newName' });
 
   const s = sessions.get(name);
   if (!s) return sendJson(res, 200, { ok: false, error: `Session '${name}' not found` });
@@ -968,6 +1264,7 @@ const handleSessionRestart: RouteHandler = async (_req, res, body) => {
   s.stats = makeStats();
   s.history = [];
 
+  sessions.markDirty();
   sendJson(res, 200, { ok: true });
 };
 
@@ -1001,6 +1298,11 @@ const routes: Record<string, { method: string; handler: RouteHandler }> = {
 // ─── Server ──────────────────────────────────────────────────────────────────
 
 const server = http.createServer(async (req, res) => {
+  // Reject new requests during shutdown
+  if (isShuttingDown) {
+    return sendJson(res, 503, { ok: false, error: 'Server is shutting down' });
+  }
+
   // CORS preflight
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
@@ -1027,34 +1329,122 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 405, { ok: false, error: `Method ${req.method} not allowed` });
   }
 
+  // Rate limiting
+  const clientIp = getClientIp(req);
+  const rlGroup = endpointRateLimitGroup[endpoint] || 'write';
+  if (!checkRateLimit(clientIp, rlGroup)) {
+    return sendJson(res, 429, {
+      ok: false,
+      error: `Rate limit exceeded. Max ${RATE_LIMITS[rlGroup]} requests per minute for this endpoint group.`,
+    });
+  }
+
+  inFlightRequests++;
   try {
     const body = req.method === 'POST' ? await readBody(req) : {};
     await route.handler(req, res, body);
   } catch (err) {
-    console.error(`Error handling ${endpoint}:`, err);
     if (!res.headersSent) {
-      sendJson(res, 500, { ok: false, error: (err as Error).message });
+      if (err instanceof BodyTooLargeError) {
+        sendJson(res, 413, { ok: false, error: err.message });
+      } else if (err instanceof MalformedJsonError) {
+        sendJson(res, 400, { ok: false, error: err.message });
+      } else {
+        console.error(`Error handling ${endpoint}:`, err);
+        sendJson(res, 500, { ok: false, error: (err as Error).message });
+      }
     }
+  } finally {
+    inFlightRequests--;
   }
 });
 
 // ─── Graceful shutdown ───────────────────────────────────────────────────────
 
-function shutdown(): void {
-  console.log('\nShutting down...');
-  for (const [, s] of sessions) {
-    if (s.activeProcess) {
-      s.activeProcess.kill('SIGTERM');
-    }
+function killAllTrackedProcesses(): void {
+  for (const proc of trackedProcesses) {
+    try {
+      if (!proc.killed) proc.kill('SIGTERM');
+    } catch { /* already dead */ }
   }
-  sessions.clear();
-  server.close(() => process.exit(0));
-  // Force exit after 5s
-  setTimeout(() => process.exit(1), 5000);
+  // After 3s, force-kill anything still alive
+  setTimeout(() => {
+    for (const proc of trackedProcesses) {
+      try {
+        if (!proc.killed) proc.kill('SIGKILL');
+      } catch { /* already dead */ }
+    }
+    trackedProcesses.clear();
+  }, 3000);
+}
+
+function shutdown(): void {
+  if (isShuttingDown) return; // Prevent double-shutdown
+  isShuttingDown = true;
+  console.log('\nShutting down gracefully...');
+
+  // 1. Stop accepting new connections
+  server.close(() => {
+    console.log('Server closed, no more connections.');
+  });
+
+  // 2. Wait for in-flight requests to finish (up to 10s)
+  const shutdownStart = Date.now();
+  const SHUTDOWN_TIMEOUT = 10_000;
+
+  const waitForInflight = setInterval(() => {
+    const elapsed = Date.now() - shutdownStart;
+    if (inFlightRequests <= 0 || elapsed >= SHUTDOWN_TIMEOUT) {
+      clearInterval(waitForInflight);
+
+      if (inFlightRequests > 0) {
+        console.log(`Shutdown timeout: ${inFlightRequests} requests still in-flight, forcing exit.`);
+      } else {
+        console.log('All in-flight requests completed.');
+      }
+
+      // 3. Kill all session active processes and flush to disk
+      for (const [, s] of sessions) {
+        if (s.activeProcess) {
+          try { s.activeProcess.kill('SIGTERM'); } catch { /* ignore */ }
+          s.activeProcess = null;
+        }
+      }
+      // Persist sessions to disk before we tear everything down
+      sessions.flush();
+
+      // 4. Kill all tracked child processes
+      killAllTrackedProcesses();
+
+      // 5. Clear the zombie cleanup interval
+      clearInterval(zombieCleanupInterval);
+
+      // 6. Exit after giving SIGKILL time to propagate
+      setTimeout(() => process.exit(0), 3500);
+    }
+  }, 200);
+
+  // Hard deadline: force exit after 15s no matter what
+  setTimeout(() => {
+    console.error('Hard shutdown deadline reached, forcing exit.');
+    process.exit(1);
+  }, 15_000).unref();
 }
 
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
+
+// ─── Uncaught Exception / Rejection Handling ─────────────────────────────────
+
+process.on('uncaughtException', (err) => {
+  console.error('[UNCAUGHT EXCEPTION] Server will continue running:', err);
+  // Do not crash — log and continue
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[UNHANDLED REJECTION] Server will continue running:', reason);
+  // Do not crash — log and continue
+});
 
 // ─── Start ───────────────────────────────────────────────────────────────────
 

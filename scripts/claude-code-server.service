@@ -1,0 +1,76 @@
+# systemd service unit for claude-code-server
+# =============================================
+#
+# Install:
+#   sudo cp scripts/claude-code-server.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable claude-code-server
+#   sudo systemctl start claude-code-server
+#
+# Or for user-level service (no sudo needed):
+#   mkdir -p ~/.config/systemd/user/
+#   cp scripts/claude-code-server.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable claude-code-server
+#   systemctl --user start claude-code-server
+#
+# Status:
+#   sudo systemctl status claude-code-server
+#   journalctl -u claude-code-server -f
+#
+# Stop:
+#   sudo systemctl stop claude-code-server
+
+[Unit]
+Description=Claude Code Skill Backend Server
+Documentation=https://github.com/Scamwick/openclaw-claude-code-skill
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/node /opt/claude-code-server/dist/server.js
+WorkingDirectory=/opt/claude-code-server
+
+# Environment
+Environment=NODE_ENV=production
+Environment=CLAUDE_CODE_PORT=18795
+Environment=CLAUDE_CODE_HOST=127.0.0.1
+Environment=HOME=/home/claude-code
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/home/claude-code/.local/bin
+
+# Run as dedicated non-root user
+User=claude-code
+Group=claude-code
+
+# Restart policy
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Graceful shutdown: send SIGTERM, wait 30s, then SIGKILL
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+ReadWritePaths=/opt/claude-code-server
+ReadOnlyPaths=/home/claude-code/.claude
+
+# Resource limits
+LimitNOFILE=4096
+MemoryMax=2G
+CPUQuota=200%
+
+# Logging (goes to journald by default)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=claude-code-server
+
+[Install]
+WantedBy=multi-user.target

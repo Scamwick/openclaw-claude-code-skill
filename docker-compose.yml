@@ -1,0 +1,40 @@
+version: "3.8"
+
+services:
+  claude-code-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: claude-code-server
+    ports:
+      - "18795:18795"
+    volumes:
+      # Mount host Claude CLI auth so the container can spawn authenticated claude processes
+      - "${HOME}/.claude:/home/appuser/.claude:ro"
+    environment:
+      - CLAUDE_CODE_PORT=18795
+      - CLAUDE_CODE_HOST=0.0.0.0
+      - NODE_ENV=production
+      # Override if claude binary is at a non-standard path inside the container
+      # - CLAUDE_BIN=/usr/local/bin/claude
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:18795/backend-api/claude-code/tools"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # Resource limits (adjust as needed for your workload)
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "2.0"
+        reservations:
+          memory: 256M
+          cpus: "0.5"

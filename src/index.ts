@@ -5,9 +5,100 @@
  */
 
 import { Command } from 'commander';
+import { createRequire } from 'module';
 
-const BACKEND_API_URL = process.env.BACKEND_API_URL || 'http://127.0.0.1:18795';
+// ---------------------------------------------------------------------------
+// Version (read from package.json at runtime)
+// ---------------------------------------------------------------------------
+const require_ = createRequire(import.meta.url);
+const pkg = require_('../package.json') as { version: string };
+const CLI_VERSION = pkg.version;
+
+// ---------------------------------------------------------------------------
+// ANSI color helpers
+// ---------------------------------------------------------------------------
+const ANSI = {
+  reset: '\x1b[0m',
+  bold: '\x1b[1m',
+  dim: '\x1b[2m',
+  red: '\x1b[31m',
+  green: '\x1b[32m',
+  yellow: '\x1b[33m',
+  blue: '\x1b[34m',
+  cyan: '\x1b[36m',
+} as const;
+
+/** Wrap text in an ANSI color. Returns plain text when --json mode is active. */
+function c(color: keyof typeof ANSI, text: string): string {
+  if (globalJsonMode) return text;
+  return `${ANSI[color]}${text}${ANSI.reset}`;
+}
+
+// ---------------------------------------------------------------------------
+// Global state derived from CLI flags (set before sub-command actions run)
+// ---------------------------------------------------------------------------
+let globalJsonMode = false;
+let resolvedServerUrl = '';
+
+function getServerUrl(): string {
+  return resolvedServerUrl;
+}
+
 const PREFIX = '/backend-api/claude-code';
+
+// ---------------------------------------------------------------------------
+// Output helpers
+// ---------------------------------------------------------------------------
+
+/** Print structured output — JSON when --json flag is set, otherwise formatted. */
+function out(data: Record<string, unknown>, formatted: string): void {
+  if (globalJsonMode) {
+    console.log(JSON.stringify(data, null, 2));
+  } else {
+    console.log(formatted);
+  }
+}
+
+/** Print an error with colour and optional hint, or as JSON. */
+function errOut(message: string, hint?: string): void {
+  if (globalJsonMode) {
+    console.log(JSON.stringify({ ok: false, error: message, hint: hint || undefined }));
+  } else {
+    console.error(`${c('red', 'Error:')} ${message}`);
+    if (hint) console.error(`${c('dim', hint)}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Connection-error detection
+// ---------------------------------------------------------------------------
+function isConnectionError(err: Error): boolean {
+  const msg = err.message.toLowerCase();
+  return (
+    msg.includes('econnrefused') ||
+    msg.includes('econnreset') ||
+    msg.includes('enotfound') ||
+    msg.includes('fetch failed') ||
+    msg.includes('networkerror') ||
+    msg.includes('eaddrnotavail')
+  );
+}
+
+function connectionErrorMessage(): string {
+  const url = getServerUrl();
+  if (globalJsonMode) {
+    return JSON.stringify({ ok: false, error: `Cannot connect to claude-code-server at ${url}`, hint: 'Start the server with: claude-code-server' });
+  }
+  return [
+    `${c('red', 'Error:')} Cannot connect to claude-code-server at ${c('cyan', url)}`,
+    '',
+    `  Start the server with:  ${c('bold', 'claude-code-server')}`,
+  ].join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// API helpers
+// ---------------------------------------------------------------------------
 
 interface ApiResponse {
   ok: boolean;
@@ -16,7 +107,7 @@ interface ApiResponse {
 }
 
 async function apiCall(endpoint: string, method: string = 'GET', body?: object): Promise<ApiResponse> {
-  const url = `${BACKEND_API_URL}${PREFIX}${endpoint}`;
+  const url = `${getServerUrl()}${PREFIX}${endpoint}`;
   const options: RequestInit = {
     method,
     headers: { 'Content-Type': 'application/json' },
@@ -29,30 +120,138 @@ async function apiCall(endpoint: string, method: string = 'GET', body?: object):
     const response = await fetch(url, options);
     return await response.json() as ApiResponse;
   } catch (error) {
-    return { ok: false, error: (error as Error).message };
+    const err = error as Error;
+    if (isConnectionError(err)) {
+      // Print a friendly message and exit immediately
+      console.error(connectionErrorMessage());
+      process.exit(1);
+    }
+    return { ok: false, error: err.message };
   }
 }
+
+// ---------------------------------------------------------------------------
+// Program definition
+// ---------------------------------------------------------------------------
 
 const program = new Command();
 
 program
   .name('claude-code-skill')
   .description('Control Claude Code via MCP protocol')
-  .version('1.0.0');
+  .version(CLI_VERSION)
+  .option('--server-url <url>', 'Override the server URL (env: CLAUDE_CODE_SERVER_URL)')
+  .option('--json', 'Output raw JSON (useful for scripting)')
+  .hook('preAction', (_thisCommand) => {
+    const opts = program.opts<{ serverUrl?: string; json?: boolean }>();
+    globalJsonMode = opts.json ?? false;
+    resolvedServerUrl =
+      opts.serverUrl ||
+      process.env.CLAUDE_CODE_SERVER_URL ||
+      process.env.BACKEND_API_URL ||
+      'http://127.0.0.1:18795';
+  });
 
+// ---------------------------------------------------------------------------
+// Health command
+// ---------------------------------------------------------------------------
+program
+  .command('health')
+  .description('Check server health and connectivity')
+  .action(async () => {
+    const serverUrl = getServerUrl();
+    const startMs = Date.now();
+
+    try {
+      const response = await fetch(`${serverUrl}${PREFIX}/connect`, {
+        method: 'GET',
+        headers: { 'Content-Type': 'application/json' },
+        signal: AbortSignal.timeout(5000),
+      });
+      const latencyMs = Date.now() - startMs;
+
+      let body: Record<string, unknown> = {};
+      try {
+        body = await response.json() as Record<string, unknown>;
+      } catch {
+        // response may not be JSON
+      }
+
+      // Also try to get session list for an active-session count
+      let activeSessions = 0;
+      try {
+        const sessRes = await fetch(`${serverUrl}${PREFIX}/session/list`, {
+          method: 'GET',
+          headers: { 'Content-Type': 'application/json' },
+          signal: AbortSignal.timeout(3000),
+        });
+        const sessBody = await sessRes.json() as { ok?: boolean; sessions?: unknown[] };
+        if (sessBody.ok && Array.isArray(sessBody.sessions)) {
+          activeSessions = sessBody.sessions.length;
+        }
+      } catch {
+        // session endpoint may not exist; not critical
+      }
+
+      const data = {
+        ok: true,
+        serverUrl,
+        httpStatus: response.status,
+        latencyMs,
+        activeSessions,
+        uptime: body.uptime ?? null,
+        serverInfo: body,
+      };
+
+      if (globalJsonMode) {
+        console.log(JSON.stringify(data, null, 2));
+      } else {
+        console.log(`${c('green', 'Server is reachable')}  ${c('cyan', serverUrl)}`);
+        console.log(`  HTTP status:      ${response.status}`);
+        console.log(`  Latency:          ${latencyMs}ms`);
+        console.log(`  Active sessions:  ${activeSessions}`);
+        if (body.uptime != null) {
+          console.log(`  Uptime:           ${body.uptime}s`);
+        }
+      }
+    } catch (error) {
+      const err = error as Error;
+      if (isConnectionError(err) || err.name === 'TimeoutError' || err.name === 'AbortError') {
+        const data = { ok: false, serverUrl, error: `Cannot reach server at ${serverUrl}` };
+        if (globalJsonMode) {
+          console.log(JSON.stringify(data, null, 2));
+        } else {
+          console.error(`${c('red', 'Server is unreachable')}  ${c('cyan', serverUrl)}`);
+          console.error('');
+          console.error(`  Start the server with:  ${c('bold', 'claude-code-server')}`);
+        }
+        process.exit(1);
+      }
+      errOut(err.message);
+      process.exit(1);
+    }
+  });
+
+// ---------------------------------------------------------------------------
 // Connect command
+// ---------------------------------------------------------------------------
 program
   .command('connect')
   .description('Connect to Claude Code MCP server')
   .action(async () => {
-    console.log('Connecting to Claude Code...');
+    out({ status: 'connecting' }, `${c('dim', 'Connecting to Claude Code...')}`);
     const result = await apiCall('/connect', 'POST');
     if (result.ok) {
-      console.log(`Connected! Status: ${result.status}`);
-      console.log(`Server: ${JSON.stringify(result.server)}`);
-      console.log(`Available tools: ${result.tools}`);
+      out(
+        { ok: true, status: result.status, server: result.server, tools: result.tools },
+        [
+          `${c('green', 'Connected!')} Status: ${result.status}`,
+          `  Server: ${c('cyan', JSON.stringify(result.server))}`,
+          `  Available tools: ${c('cyan', String(result.tools))}`,
+        ].join('\n'),
+      );
     } else {
-      console.error(`Failed: ${result.error}`);
+      errOut(String(result.error));
       process.exit(1);
     }
   });
@@ -64,9 +263,9 @@ program
   .action(async () => {
     const result = await apiCall('/disconnect', 'POST');
     if (result.ok) {
-      console.log('Disconnected from Claude Code');
+      out({ ok: true }, c('green', 'Disconnected from Claude Code'));
     } else {
-      console.error(`Failed: ${result.error}`);
+      errOut(String(result.error));
     }
   });
 
@@ -77,14 +276,17 @@ program
   .action(async () => {
     const result = await apiCall('/tools');
     if (result.ok && Array.isArray(result.tools)) {
-      console.log('Available tools:');
-      for (const tool of result.tools) {
-        const t = tool as { name: string; description: string };
-        console.log(`  - ${t.name}: ${t.description}`);
+      if (globalJsonMode) {
+        console.log(JSON.stringify({ ok: true, tools: result.tools }, null, 2));
+      } else {
+        console.log(c('cyan', 'Available tools:'));
+        for (const tool of result.tools) {
+          const t = tool as { name: string; description: string };
+          console.log(`  ${c('bold', t.name)}: ${t.description}`);
+        }
       }
     } else {
-      console.error(`Failed: ${result.error || 'Not connected'}`);
-      console.log('Tip: Run "claude-code-skill connect" first');
+      errOut(String(result.error || 'Not connected'), 'Run "claude-code-skill connect" first');
     }
   });
 
@@ -99,11 +301,15 @@ program
       description: options.description || ''
     });
     if (result.ok) {
-      const r = result.result as { stdout?: string; stderr?: string };
-      if (r.stdout) console.log(r.stdout);
-      if (r.stderr) console.error(r.stderr);
+      if (globalJsonMode) {
+        console.log(JSON.stringify({ ok: true, result: result.result }, null, 2));
+      } else {
+        const r = result.result as { stdout?: string; stderr?: string };
+        if (r.stdout) console.log(r.stdout);
+        if (r.stderr) console.error(c('red', r.stderr));
+      }
     } else {
-      console.error(`Failed: ${result.error}`);
+      errOut(String(result.error));
     }
   });
 
@@ -114,14 +320,18 @@ program
   .action(async (filePath: string) => {
     const result = await apiCall('/read', 'POST', { file_path: filePath });
     if (result.ok) {
-      const r = result.result as { type?: string; file?: { content?: string } };
-      if (r.file?.content) {
-        console.log(r.file.content);
+      if (globalJsonMode) {
+        console.log(JSON.stringify({ ok: true, result: result.result }, null, 2));
       } else {
-        console.log(JSON.stringify(result.result, null, 2));
+        const r = result.result as { type?: string; file?: { content?: string } };
+        if (r.file?.content) {
+          console.log(r.file.content);
+        } else {
+          console.log(JSON.stringify(result.result, null, 2));
+        }
       }
     } else {
-      console.error(`Failed: ${result.error}`);
+      errOut(String(result.error));
     }
   });
 
@@ -135,15 +345,19 @@ program
     try {
       args = JSON.parse(options.args);
     } catch {
-      console.error('Invalid JSON args');
+      errOut('Invalid JSON args');
       process.exit(1);
     }
 
     const result = await apiCall('/call', 'POST', { tool, args });
     if (result.ok) {
-      console.log(JSON.stringify(result.result, null, 2));
+      if (globalJsonMode) {
+        console.log(JSON.stringify({ ok: true, result: result.result }, null, 2));
+      } else {
+        console.log(JSON.stringify(result.result, null, 2));
+      }
     } else {
-      console.error(`Failed: ${result.error}`);
+      errOut(String(result.error));
     }
   });
 
@@ -158,14 +372,18 @@ program
 
     const result = await apiCall('/call', 'POST', { tool: 'Glob', args });
     if (result.ok) {
-      const r = result.result as { filenames?: string[] };
-      if (r.filenames) {
-        for (const f of r.filenames) console.log(f);
+      if (globalJsonMode) {
+        console.log(JSON.stringify({ ok: true, result: result.result }, null, 2));
       } else {
-        console.log(JSON.stringify(result.result, null, 2));
+        const r = result.result as { filenames?: string[] };
+        if (r.filenames) {
+          for (const f of r.filenames) console.log(c('cyan', f));
+        } else {
+          console.log(JSON.stringify(result.result, null, 2));
+        }
       }
     } else {
-      console.error(`Failed: ${result.error}`);
+      errOut(String(result.error));
     }
   });
 
@@ -184,16 +402,20 @@ program
 
     const result = await apiCall('/call', 'POST', { tool: 'Grep', args });
     if (result.ok) {
-      const r = result.result as { filenames?: string[]; content?: string };
-      if (r.content) {
-        console.log(r.content);
-      } else if (r.filenames) {
-        for (const f of r.filenames) console.log(f);
+      if (globalJsonMode) {
+        console.log(JSON.stringify({ ok: true, result: result.result }, null, 2));
       } else {
-        console.log(JSON.stringify(result.result, null, 2));
+        const r = result.result as { filenames?: string[]; content?: string };
+        if (r.content) {
+          console.log(r.content);
+        } else if (r.filenames) {
+          for (const f of r.filenames) console.log(c('cyan', f));
+        } else {
+          console.log(JSON.stringify(result.result, null, 2));
+        }
       }
     } else {
-      console.error(`Failed: ${result.error}`);
+      errOut(String(result.error));
     }
   });
 
@@ -205,11 +427,23 @@ program
     // Try to get tools - if it works, we're connected
     const result = await apiCall('/tools');
     if (result.ok) {
-      console.log('Status: Connected');
-      console.log(`Tools available: ${(result.tools as unknown[]).length}`);
+      const toolCount = (result.tools as unknown[]).length;
+      out(
+        { ok: true, connected: true, toolCount, serverUrl: getServerUrl() },
+        [
+          `${c('green', 'Status: Connected')}`,
+          `  Server:          ${c('cyan', getServerUrl())}`,
+          `  Tools available: ${toolCount}`,
+        ].join('\n'),
+      );
     } else {
-      console.log('Status: Not connected');
-      console.log('Run "claude-code-skill connect" to connect');
+      out(
+        { ok: true, connected: false, serverUrl: getServerUrl() },
+        [
+          `${c('yellow', 'Status: Not connected')}`,
+          `  Run ${c('bold', '"claude-code-skill connect"')} to connect`,
+        ].join('\n'),
+      );
     }
   });
 
@@ -222,24 +456,28 @@ program
     const result = await apiCall('/sessions');
     if (result.ok && Array.isArray(result.sessions)) {
       const sessions = result.sessions.slice(0, parseInt(options.limit));
-      console.log('Recent Claude Code sessions:\n');
-      for (const s of sessions) {
-        const sess = s as {
-          sessionId: string;
-          summary?: string;
-          projectPath?: string;
-          modified?: string;
-          messageCount?: number;
-        };
-        console.log(`  ${sess.sessionId}`);
-        console.log(`    Summary: ${sess.summary || 'N/A'}`);
-        console.log(`    Project: ${sess.projectPath || 'N/A'}`);
-        console.log(`    Modified: ${sess.modified || 'N/A'}`);
-        console.log(`    Messages: ${sess.messageCount || 0}`);
-        console.log('');
+      if (globalJsonMode) {
+        console.log(JSON.stringify({ ok: true, sessions }, null, 2));
+      } else {
+        console.log(c('cyan', 'Recent Claude Code sessions:\n'));
+        for (const s of sessions) {
+          const sess = s as {
+            sessionId: string;
+            summary?: string;
+            projectPath?: string;
+            modified?: string;
+            messageCount?: number;
+          };
+          console.log(`  ${c('bold', sess.sessionId)}`);
+          console.log(`    Summary:  ${sess.summary || c('dim', 'N/A')}`);
+          console.log(`    Project:  ${sess.projectPath || c('dim', 'N/A')}`);
+          console.log(`    Modified: ${sess.modified || c('dim', 'N/A')}`);
+          console.log(`    Messages: ${sess.messageCount || 0}`);
+          console.log('');
+        }
       }
     } else {
-      console.error(`Failed: ${result.error || 'Unknown error'}`);
+      errOut(String(result.error || 'Unknown error'));
     }
   });
 
@@ -249,17 +487,21 @@ program
   .description('Resume a Claude Code session with a prompt')
   .option('-d, --cwd <dir>', 'Working directory')
   .action(async (sessionId: string, prompt: string, options: { cwd?: string }) => {
-    console.log(`Resuming session ${sessionId}...`);
+    if (!globalJsonMode) console.log(c('dim', `Resuming session ${sessionId}...`));
     const result = await apiCall('/resume', 'POST', {
       sessionId,
       prompt,
       cwd: options.cwd
     });
     if (result.ok) {
-      console.log(result.output as string);
-      if (result.stderr) console.error(result.stderr as string);
+      if (globalJsonMode) {
+        console.log(JSON.stringify({ ok: true, output: result.output, stderr: result.stderr }, null, 2));
+      } else {
+        console.log(result.output as string);
+        if (result.stderr) console.error(c('red', result.stderr as string));
+      }
     } else {
-      console.error(`Failed: ${result.error}`);
+      errOut(String(result.error));
     }
   });
 
@@ -269,16 +511,20 @@ program
   .description('Continue the most recent session in a directory')
   .option('-d, --cwd <dir>', 'Working directory', process.cwd())
   .action(async (prompt: string, options: { cwd: string }) => {
-    console.log(`Continuing session in ${options.cwd}...`);
+    if (!globalJsonMode) console.log(c('dim', `Continuing session in ${options.cwd}...`));
     const result = await apiCall('/continue', 'POST', {
       prompt,
       cwd: options.cwd
     });
     if (result.ok) {
-      console.log(result.output as string);
-      if (result.stderr) console.error(result.stderr as string);
+      if (globalJsonMode) {
+        console.log(JSON.stringify({ ok: true, output: result.output, stderr: result.stderr }, null, 2));
+      } else {
+        console.log(result.output as string);
+        if (result.stderr) console.error(c('red', result.stderr as string));
+      }
     } else {
-      console.error(`Failed: ${result.error}`);
+      errOut(String(result.error));
     }
   });
 
@@ -385,22 +631,32 @@ program
     const result = await apiCall('/session/start', 'POST', body);
 
     if (result.ok) {
-      console.log(`Session '${sessionName}' started!`);
-      if (result.claudeSessionId) {
-        console.log(`Claude Session ID: ${result.claudeSessionId}`);
+      if (globalJsonMode) {
+        console.log(JSON.stringify({
+          ok: true,
+          name: sessionName,
+          claudeSessionId: result.claudeSessionId,
+          model: options.model,
+          permissionMode: options.permissionMode || 'acceptEdits',
+        }, null, 2));
+      } else {
+        console.log(`${c('green', 'Session started!')} ${c('bold', sessionName)}`);
+        if (result.claudeSessionId) {
+          console.log(`  Claude Session ID: ${c('cyan', String(result.claudeSessionId))}`);
+        }
+        // Show active options
+        if (options.model) console.log(`  Model: ${options.model}`);
+        if (options.baseUrl) console.log(`  Base URL: ${options.baseUrl}`);
+        console.log(`  Permission mode: ${options.permissionMode || 'acceptEdits'}`);
+        if (options.allowedTools) console.log(`  Allowed tools: ${options.allowedTools}`);
+        if (options.disallowedTools) console.log(`  Disallowed tools: ${options.disallowedTools}`);
+        if (options.tools) console.log(`  Available tools: ${options.tools}`);
+        if (options.maxTurns) console.log(`  Max turns: ${options.maxTurns}`);
+        if (options.maxBudget) console.log(`  Max budget: $${options.maxBudget}`);
+        if (options.forkSession) console.log(`  Fork mode: enabled`);
       }
-      // Show active options
-      if (options.model) console.log(`Model: ${options.model}`);
-      if (options.baseUrl) console.log(`Base URL: ${options.baseUrl}`);
-      console.log(`Permission mode: ${options.permissionMode || 'acceptEdits'}`);
-      if (options.allowedTools) console.log(`Allowed tools: ${options.allowedTools}`);
-      if (options.disallowedTools) console.log(`Disallowed tools: ${options.disallowedTools}`);
-      if (options.tools) console.log(`Available tools: ${options.tools}`);
-      if (options.maxTurns) console.log(`Max turns: ${options.maxTurns}`);
-      if (options.maxBudget) console.log(`Max budget: $${options.maxBudget}`);
-      if (options.forkSession) console.log(`Fork mode: enabled`);
     } else {
-      console.error(`Failed: ${result.error}`);
+      errOut(String(result.error));
     }
   });
 
@@ -411,11 +667,11 @@ program
   .option('-t, --timeout <ms>', 'Timeout in milliseconds', '120000')
   .option('-s, --stream', 'Stream output in real-time')
   .action(async (name: string, message: string, options: { timeout: string; stream?: boolean }) => {
-    console.log(`Sending to session '${name}'...`);
+    if (!globalJsonMode) console.log(c('dim', `Sending to session '${name}'...`));
 
     if (options.stream) {
       // Use SSE streaming endpoint
-      const url = `${BACKEND_API_URL}${PREFIX}/session/send-stream`;
+      const url = `${getServerUrl()}${PREFIX}/session/send-stream`;
       try {
         const response = await fetch(url, {
           method: 'POST',
@@ -462,7 +718,12 @@ program
           }
         }
       } catch (error) {
-        console.error(`Stream error: ${(error as Error).message}`);
+        const err = error as Error;
+        if (isConnectionError(err)) {
+          console.error(connectionErrorMessage());
+          process.exit(1);
+        }
+        errOut(`Stream error: ${err.message}`);
       }
     } else {
       // Non-streaming mode
@@ -473,9 +734,13 @@ program
       });
 
       if (result.ok) {
-        console.log(result.response as string);
+        if (globalJsonMode) {
+          console.log(JSON.stringify({ ok: true, response: result.response }, null, 2));
+        } else {
+          console.log(result.response as string);
+        }
       } else {
-        console.error(`Failed: ${result.error}`);
+        errOut(String(result.error));
       }
     }
   });
@@ -487,10 +752,12 @@ program
   .action(async () => {
     const result = await apiCall('/session/list');
     if (result.ok && Array.isArray(result.sessions)) {
-      if (result.sessions.length === 0) {
-        console.log('No active persistent sessions.');
+      if (globalJsonMode) {
+        console.log(JSON.stringify({ ok: true, sessions: result.sessions }, null, 2));
+      } else if (result.sessions.length === 0) {
+        console.log(c('yellow', 'No active persistent sessions.'));
       } else {
-        console.log('Active persistent sessions:\n');
+        console.log(c('cyan', 'Active persistent sessions:\n'));
         for (const s of result.sessions) {
           const sess = s as {
             name: string;
@@ -498,15 +765,15 @@ program
             created?: string;
             isReady?: boolean;
           };
-          console.log(`  ${sess.name}`);
-          console.log(`    CWD: ${sess.cwd || 'N/A'}`);
-          console.log(`    Created: ${sess.created || 'N/A'}`);
-          console.log(`    Ready: ${sess.isReady ? 'Yes' : 'No'}`);
+          console.log(`  ${c('bold', sess.name)}`);
+          console.log(`    CWD:     ${sess.cwd || c('dim', 'N/A')}`);
+          console.log(`    Created: ${sess.created || c('dim', 'N/A')}`);
+          console.log(`    Ready:   ${sess.isReady ? c('green', 'Yes') : c('red', 'No')}`);
           console.log('');
         }
       }
     } else {
-      console.error(`Failed: ${result.error || 'Unknown error'}`);
+      errOut(String(result.error || 'Unknown error'));
     }
   });
 
@@ -517,9 +784,9 @@ program
   .action(async (name: string) => {
     const result = await apiCall('/session/stop', 'POST', { name });
     if (result.ok) {
-      console.log(`Session '${name}' stopped.`);
+      out({ ok: true, name }, c('green', `Session '${name}' stopped.`));
     } else {
-      console.error(`Failed: ${result.error}`);
+      errOut(String(result.error));
     }
   });
 
@@ -530,11 +797,6 @@ program
   .action(async (name: string) => {
     const result = await apiCall('/session/status', 'POST', { name });
     if (result.ok) {
-      console.log(`Session: ${name}`);
-      console.log(`  Claude ID: ${result.claudeSessionId || 'N/A'}`);
-      console.log(`  CWD: ${result.cwd}`);
-      console.log(`  Created: ${result.created}`);
-      
       const stats = result.stats as {
         turns?: number;
         toolCalls?: number;
@@ -544,17 +806,33 @@ program
         lastActivity?: string;
         isReady?: boolean;
       };
-      
-      console.log('\nStatistics:');
-      console.log(`  Ready: ${stats.isReady ? 'Yes' : 'No'}`);
-      console.log(`  Turns: ${stats.turns || 0}`);
-      console.log(`  Tool Calls: ${stats.toolCalls || 0}`);
-      console.log(`  Tokens In: ${stats.tokensIn || 0}`);
-      console.log(`  Tokens Out: ${stats.tokensOut || 0}`);
-      console.log(`  Uptime: ${stats.uptime || 0}s`);
-      console.log(`  Last Activity: ${stats.lastActivity || 'N/A'}`);
+
+      if (globalJsonMode) {
+        console.log(JSON.stringify({
+          ok: true,
+          name,
+          claudeSessionId: result.claudeSessionId,
+          cwd: result.cwd,
+          created: result.created,
+          stats,
+        }, null, 2));
+      } else {
+        console.log(`${c('cyan', 'Session:')} ${c('bold', name)}`);
+        console.log(`  Claude ID: ${result.claudeSessionId || c('dim', 'N/A')}`);
+        console.log(`  CWD:       ${result.cwd}`);
+        console.log(`  Created:   ${result.created}`);
+
+        console.log(`\n${c('cyan', 'Statistics:')}`);
+        console.log(`  Ready:         ${stats.isReady ? c('green', 'Yes') : c('red', 'No')}`);
+        console.log(`  Turns:         ${stats.turns || 0}`);
+        console.log(`  Tool Calls:    ${stats.toolCalls || 0}`);
+        console.log(`  Tokens In:     ${stats.tokensIn || 0}`);
+        console.log(`  Tokens Out:    ${stats.tokensOut || 0}`);
+        console.log(`  Uptime:        ${stats.uptime || 0}s`);
+        console.log(`  Last Activity: ${stats.lastActivity || c('dim', 'N/A')}`);
+      }
     } else {
-      console.error(`Failed: ${result.error}`);
+      errOut(String(result.error));
     }
   });
 
@@ -564,39 +842,43 @@ program
   .description('Get conversation history of a persistent session')
   .option('-n, --limit <n>', 'Number of events to show', '20')
   .action(async (name: string, options: { limit: string }) => {
-    const result = await apiCall('/session/history', 'POST', { 
-      name, 
-      limit: parseInt(options.limit) 
+    const result = await apiCall('/session/history', 'POST', {
+      name,
+      limit: parseInt(options.limit)
     });
     if (result.ok) {
-      console.log(`Session '${name}' history (${result.count} events):\n`);
-      
-      const history = result.history as Array<{
-        time: string;
-        type: string;
-        event: { message?: { content?: Array<{ type: string; text?: string; name?: string }> } };
-      }>;
-      
-      for (const entry of history) {
-        const time = new Date(entry.time).toLocaleTimeString();
-        const type = entry.type.padEnd(12);
-        
-        let content = '';
-        if (entry.event.message?.content) {
-          for (const c of entry.event.message.content) {
-            if (c.type === 'text' && c.text) {
-              content = c.text.substring(0, 60).replace(/\n/g, ' ');
-              if (c.text.length > 60) content += '...';
-            } else if (c.type === 'tool_use' && c.name) {
-              content = `[Tool: ${c.name}]`;
+      if (globalJsonMode) {
+        console.log(JSON.stringify({ ok: true, name, count: result.count, history: result.history }, null, 2));
+      } else {
+        console.log(`${c('cyan', `Session '${name}' history`)} (${result.count} events):\n`);
+
+        const history = result.history as Array<{
+          time: string;
+          type: string;
+          event: { message?: { content?: Array<{ type: string; text?: string; name?: string }> } };
+        }>;
+
+        for (const entry of history) {
+          const time = new Date(entry.time).toLocaleTimeString();
+          const type = entry.type.padEnd(12);
+
+          let content = '';
+          if (entry.event.message?.content) {
+            for (const item of entry.event.message.content) {
+              if (item.type === 'text' && item.text) {
+                content = item.text.substring(0, 60).replace(/\n/g, ' ');
+                if (item.text.length > 60) content += '...';
+              } else if (item.type === 'tool_use' && item.name) {
+                content = `[Tool: ${item.name}]`;
+              }
             }
           }
+
+          console.log(`${c('dim', `[${time}]`)} ${c('cyan', type)} ${content}`);
         }
-        
-        console.log(`[${time}] ${type} ${content}`);
       }
     } else {
-      console.error(`Failed: ${result.error}`);
+      errOut(String(result.error));
     }
   });
 
@@ -607,10 +889,15 @@ program
   .action(async (name: string) => {
     const result = await apiCall('/session/pause', 'POST', { name });
     if (result.ok) {
-      console.log(`Session '${name}' paused.`);
-      console.log(`Resume with: claude-code-skill session-resume ${name}`);
+      out(
+        { ok: true, name, paused: true },
+        [
+          c('green', `Session '${name}' paused.`),
+          `  Resume with: ${c('bold', `claude-code-skill session-resume-paused ${name}`)}`,
+        ].join('\n'),
+      );
     } else {
-      console.error(`Failed: ${result.error}`);
+      errOut(String(result.error));
     }
   });
 
@@ -621,9 +908,9 @@ program
   .action(async (name: string) => {
     const result = await apiCall('/session/resume', 'POST', { name });
     if (result.ok) {
-      console.log(`Session '${name}' resumed.`);
+      out({ ok: true, name, resumed: true }, c('green', `Session '${name}' resumed.`));
     } else {
-      console.error(`Failed: ${result.error}`);
+      errOut(String(result.error));
     }
   });
 
@@ -634,12 +921,16 @@ program
   .action(async (name: string, newName: string) => {
     const result = await apiCall('/session/fork', 'POST', { name, newName });
     if (result.ok) {
-      console.log(`Session '${name}' forked to '${newName}'`);
-      if (result.claudeSessionId) {
-        console.log(`New Claude Session ID: ${result.claudeSessionId}`);
+      if (globalJsonMode) {
+        console.log(JSON.stringify({ ok: true, from: name, to: newName, claudeSessionId: result.claudeSessionId }, null, 2));
+      } else {
+        console.log(c('green', `Session '${name}' forked to '${newName}'`));
+        if (result.claudeSessionId) {
+          console.log(`  New Claude Session ID: ${c('cyan', String(result.claudeSessionId))}`);
+        }
       }
     } else {
-      console.error(`Failed: ${result.error}`);
+      errOut(String(result.error));
     }
   });
 
@@ -659,21 +950,23 @@ program
     });
 
     if (result.ok && Array.isArray(result.sessions)) {
-      if (result.sessions.length === 0) {
-        console.log('No sessions found.');
+      if (globalJsonMode) {
+        console.log(JSON.stringify({ ok: true, sessions: result.sessions }, null, 2));
+      } else if (result.sessions.length === 0) {
+        console.log(c('yellow', 'No sessions found.'));
       } else {
-        console.log(`Found ${result.sessions.length} session(s):\n`);
+        console.log(`${c('cyan', 'Found')} ${result.sessions.length} session(s):\n`);
         for (const s of result.sessions) {
           const sess = s as { name: string; cwd?: string; created?: string; summary?: string };
-          console.log(`  ${sess.name}`);
-          console.log(`    CWD: ${sess.cwd || 'N/A'}`);
-          console.log(`    Created: ${sess.created || 'N/A'}`);
+          console.log(`  ${c('bold', sess.name)}`);
+          console.log(`    CWD:     ${sess.cwd || c('dim', 'N/A')}`);
+          console.log(`    Created: ${sess.created || c('dim', 'N/A')}`);
           if (sess.summary) console.log(`    Summary: ${sess.summary}`);
           console.log('');
         }
       }
     } else {
-      console.error(`Failed: ${result.error || 'Unknown error'}`);
+      errOut(String(result.error || 'Unknown error'));
     }
   });
 
@@ -689,19 +982,23 @@ program
     });
 
     if (result.ok && result.files) {
-      const files = result.files as Array<{ path: string; content: string; error?: string }>;
-      console.log(`Read ${files.length} file(s):\n`);
-      for (const file of files) {
-        console.log(`=== ${file.path} ===`);
-        if (file.error) {
-          console.error(`Error: ${file.error}`);
-        } else {
-          console.log(file.content);
+      if (globalJsonMode) {
+        console.log(JSON.stringify({ ok: true, files: result.files }, null, 2));
+      } else {
+        const files = result.files as Array<{ path: string; content: string; error?: string }>;
+        console.log(`${c('cyan', `Read ${files.length} file(s):`)}\n`);
+        for (const file of files) {
+          console.log(c('bold', `=== ${file.path} ===`));
+          if (file.error) {
+            console.error(c('red', `Error: ${file.error}`));
+          } else {
+            console.log(file.content);
+          }
+          console.log('');
         }
-        console.log('');
       }
     } else {
-      console.error(`Failed: ${result.error}`);
+      errOut(String(result.error));
     }
   });
 
@@ -712,9 +1009,9 @@ program
   .action(async (name: string) => {
     const result = await apiCall('/session/restart', 'POST', { name });
     if (result.ok) {
-      console.log(`Session '${name}' restarted.`);
+      out({ ok: true, name, restarted: true }, c('green', `Session '${name}' restarted.`));
     } else {
-      console.error(`Failed: ${result.error}`);
+      errOut(String(result.error));
     }
   });
 

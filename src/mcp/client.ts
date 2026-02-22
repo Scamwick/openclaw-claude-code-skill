@@ -4,8 +4,8 @@
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { MCPClientLogger } from "./logger";
-import { ListToolsResponse, McpRequestMessage, ServerConfig } from "./types";
+import { MCPClientLogger } from "./logger.js";
+import { ListToolsResponse, McpRequestMessage, ServerConfig } from "./types.js";
 import { z } from "zod";
 
 const logger = new MCPClientLogger();

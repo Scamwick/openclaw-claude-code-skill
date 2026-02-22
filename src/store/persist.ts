@@ -51,7 +51,7 @@ export function createPersistStore<T extends object, M>(
   }
 
   const oldOnRehydrateStorage = persistOptions?.onRehydrateStorage;
-  persistOptions.onRehydrateStorage = (state) => {
+  persistOptions.onRehydrateStorage = (state: any) => {
     oldOnRehydrateStorage?.(state);
     return () => state.setHasHydrated(true);
   };
@@ -64,7 +64,7 @@ export function createPersistStore<T extends object, M>(
           lastUpdateTime: 0,
           _hasHydrated: false,
         },
-        (set, get) => {
+        (set: any, get: any) => {
           return {
             ...methods(set, get as any),
 

@@ -2,8 +2,8 @@
  * MCP Module - Model Context Protocol integration
  */
 
-export * from "./types";
-export * from "./logger";
-export * from "./client";
-export * from "./actions";
-export * from "./utils";
+export * from "./types.js";
+export * from "./logger.js";
+export * from "./client.js";
+export * from "./actions.js";
+export * from "./utils.js";

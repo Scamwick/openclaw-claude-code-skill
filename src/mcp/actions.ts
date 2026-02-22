@@ -7,8 +7,8 @@ import {
   executeRequest,
   listTools,
   removeClient,
-} from "./client";
-import { MCPClientLogger } from "./logger";
+} from "./client.js";
+import { MCPClientLogger } from "./logger.js";
 import {
   DEFAULT_MCP_CONFIG,
   McpClientData,
@@ -16,7 +16,8 @@ import {
   McpRequestMessage,
   ServerConfig,
   ServerStatusResponse,
-} from "./types";
+} from "./types.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import fs from "fs/promises";
 import path from "path";
 
@@ -126,7 +127,7 @@ async function initializeSingleClient(
   });
 
   createClient(clientId, serverConfig)
-    .then(async (client) => {
+    .then(async (client: Client) => {
       const tools = await listTools(client);
       logger.info(
         `Supported tools for [${clientId}]: ${JSON.stringify(tools, null, 2)}`,
@@ -134,7 +135,7 @@ async function initializeSingleClient(
       clientsMap.set(clientId, { client, tools, errorMsg: null });
       logger.success(`Client [${clientId}] initialized successfully`);
     })
-    .catch((error) => {
+    .catch((error: unknown) => {
       clientsMap.set(clientId, {
         client: null,
         tools: null,

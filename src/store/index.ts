@@ -2,6 +2,6 @@
  * Store Module - State management and persistence
  */
 
-export * from "./persist";
-export * from "./indexeddb-storage";
-export * from "./sync";
+export * from "./persist.js";
+export * from "./indexeddb-storage.js";
+export * from "./sync.js";

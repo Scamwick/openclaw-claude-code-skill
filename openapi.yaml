@@ -1,0 +1,1876 @@
+openapi: 3.0.3
+info:
+  title: Claude Code Skill Backend API
+  description: |
+    Backend API server for the claude-code-skill CLI. Spawns `claude` CLI processes
+    to fulfill requests. Provides an in-memory session store for persistent,
+    stateful Claude Code sessions with streaming support.
+
+    ## Overview
+
+    The API is organized into six groups:
+
+    - **Connection** -- Connect/disconnect the backend to the Claude CLI binary.
+    - **Tools** -- Execute individual Claude tools (Bash, Read, Call) and batch operations.
+    - **OneShot** -- Fire-and-forget prompts that resume or continue existing Claude sessions.
+    - **Sessions** -- Discover past Claude CLI sessions stored on disk (`~/.claude/projects/`).
+    - **Persistent** -- Create, manage, and interact with long-lived in-memory sessions.
+    - **Resume** -- Pause, resume, fork, restart, and search persistent sessions.
+
+    ## Authentication
+
+    This server binds to `127.0.0.1` by default and does not require authentication.
+    It is intended for local development use only.
+
+    ## Error Handling
+
+    Most endpoints return HTTP 200 with `{ "ok": false, "error": "..." }` for
+    application-level errors. HTTP-level errors (400, 404, 405, 413, 500, 503)
+    are returned for protocol violations.
+  version: 1.0.0
+  contact:
+    name: enderfga
+  license:
+    name: MIT
+
+servers:
+  - url: http://127.0.0.1:18795/backend-api/claude-code
+    description: Local development server (default port)
+
+tags:
+  - name: Connection
+    description: Establish and tear down the connection to the Claude CLI binary.
+  - name: Tools
+    description: Execute individual Claude tools or batch file operations.
+  - name: OneShot
+    description: One-off prompts that resume or continue a previous Claude CLI session.
+  - name: Sessions
+    description: Discover past Claude CLI sessions stored on disk.
+  - name: Persistent
+    description: Create and interact with long-lived in-memory sessions.
+  - name: Resume
+    description: Pause, resume, fork, restart, and search persistent sessions.
+
+paths:
+  # ── Connection ────────────────────────────────────────────────────────────────
+
+  /connect:
+    post:
+      operationId: connect
+      tags: [Connection]
+      summary: Connect to the Claude CLI
+      description: |
+        Verifies that the Claude CLI binary is accessible and executable,
+        then marks the server as connected. Must be called before using
+        tool or session endpoints.
+      responses:
+        "200":
+          description: Connection result
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/ConnectSuccessResponse"
+                  - $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                success:
+                  summary: Successful connection
+                  value:
+                    ok: true
+                    status: connected
+                    server:
+                      name: claude-code-backend
+                      version: "1.0.0"
+                      bin: /Users/dev/.local/bin/claude
+                    tools: 13
+                binaryNotFound:
+                  summary: Claude binary not found
+                  value:
+                    ok: false
+                    error: "Claude binary not found at /usr/local/bin/claude. Set CLAUDE_BIN env var."
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /disconnect:
+    post:
+      operationId: disconnect
+      tags: [Connection]
+      summary: Disconnect and clean up
+      description: |
+        Kills all active session processes, clears the in-memory session store,
+        and marks the server as disconnected.
+      responses:
+        "200":
+          description: Disconnection acknowledged
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OkResponse"
+              example:
+                ok: true
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  # ── Tools ─────────────────────────────────────────────────────────────────────
+
+  /tools:
+    get:
+      operationId: listTools
+      tags: [Tools]
+      summary: List available Claude tools
+      description: |
+        Returns the list of known Claude CLI tools (Bash, Read, Write, Edit,
+        Glob, Grep, WebFetch, WebSearch, Task, NotebookEdit, TodoRead,
+        TodoWrite, AskUserQuestion). Requires an active connection.
+      responses:
+        "200":
+          description: Tool list or error if not connected
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/ToolsResponse"
+                  - $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                success:
+                  summary: Tool list
+                  value:
+                    ok: true
+                    tools:
+                      - name: Bash
+                        description: Execute bash commands
+                      - name: Read
+                        description: Read file contents
+                      - name: Write
+                        description: Write file contents
+                notConnected:
+                  summary: Server not connected
+                  value:
+                    ok: false
+                    error: Not connected
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /bash:
+    post:
+      operationId: executeBash
+      tags: [Tools]
+      summary: Execute a bash command
+      description: |
+        Runs an arbitrary shell command via Node.js `exec` and returns
+        stdout/stderr. Has a 60-second timeout and 10 MB output buffer.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [command]
+              properties:
+                command:
+                  type: string
+                  description: The shell command to execute.
+                  example: "ls -la /tmp"
+            example:
+              command: "git status --short"
+      responses:
+        "200":
+          description: Command result or validation error
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/BashResponse"
+                  - $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                success:
+                  summary: Command executed
+                  value:
+                    ok: true
+                    result:
+                      stdout: "M  src/server.ts\n"
+                      stderr: ""
+                missingCommand:
+                  summary: Missing command
+                  value:
+                    ok: false
+                    error: Missing command
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/BodyTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /read:
+    post:
+      operationId: readFile
+      tags: [Tools]
+      summary: Read a file from disk
+      description: |
+        Reads the full contents of a file at the given absolute path
+        and returns it as a UTF-8 string.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [file_path]
+              properties:
+                file_path:
+                  type: string
+                  description: Absolute path to the file to read.
+                  example: "/Users/dev/project/src/index.ts"
+            example:
+              file_path: "/Users/dev/project/README.md"
+      responses:
+        "200":
+          description: File content or error
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/ReadResponse"
+                  - $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                success:
+                  summary: File read successfully
+                  value:
+                    ok: true
+                    result:
+                      type: file
+                      file:
+                        content: "# My Project\n\nHello world."
+                notFound:
+                  summary: File not found
+                  value:
+                    ok: false
+                    error: "ENOENT: no such file or directory, open '/nonexistent'"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/BodyTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /call:
+    post:
+      operationId: callTool
+      tags: [Tools]
+      summary: Invoke a Claude tool by name
+      description: |
+        Spawns a Claude CLI process instructed to use a specific tool with
+        the given arguments. Returns the tool output. Uses `bypassPermissions`
+        mode internally.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tool]
+              properties:
+                tool:
+                  type: string
+                  description: Name of the Claude tool to invoke.
+                  example: Grep
+                args:
+                  type: object
+                  description: Arguments to pass to the tool.
+                  additionalProperties: true
+                  example:
+                    pattern: "TODO"
+                    path: "/Users/dev/project/src"
+            example:
+              tool: Glob
+              args:
+                pattern: "**/*.ts"
+      responses:
+        "200":
+          description: Tool result or error
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/CallResponse"
+                  - $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                success:
+                  summary: Tool executed
+                  value:
+                    ok: true
+                    result:
+                      - "/Users/dev/project/src/index.ts"
+                      - "/Users/dev/project/src/server.ts"
+                missingTool:
+                  summary: Missing tool name
+                  value:
+                    ok: false
+                    error: Missing tool
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/BodyTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /batch-read:
+    post:
+      operationId: batchReadFiles
+      tags: [Tools]
+      summary: Read multiple files by glob patterns
+      description: |
+        Expands one or more glob patterns against a base path, then reads
+        the matched files and returns their contents. Useful for bulk
+        code ingestion.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [patterns]
+              properties:
+                patterns:
+                  type: array
+                  items:
+                    type: string
+                  description: Glob patterns to expand.
+                  example: ["src/**/*.ts", "*.json"]
+                basePath:
+                  type: string
+                  description: Base directory for pattern expansion. Defaults to server cwd.
+                  example: "/Users/dev/project"
+            example:
+              patterns: ["src/**/*.ts"]
+              basePath: "/Users/dev/project"
+      responses:
+        "200":
+          description: Matched files with contents
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/BatchReadResponse"
+                  - $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                success:
+                  summary: Files read
+                  value:
+                    ok: true
+                    files:
+                      - path: "/Users/dev/project/src/index.ts"
+                        content: "console.log('hello');\n"
+                      - path: "/Users/dev/project/src/bad.ts"
+                        content: ""
+                        error: "EACCES: permission denied"
+                missingPatterns:
+                  summary: Missing patterns array
+                  value:
+                    ok: false
+                    error: Missing patterns array
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/BodyTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  # ── OneShot ───────────────────────────────────────────────────────────────────
+
+  /resume:
+    post:
+      operationId: resumeSession
+      tags: [OneShot]
+      summary: Send a prompt to an existing Claude session by ID
+      description: |
+        Resumes a previous Claude CLI session by its session ID and sends
+        a new prompt. Returns the JSON result. This is a one-shot call --
+        it does not create a persistent in-memory session.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sessionId, prompt]
+              properties:
+                sessionId:
+                  type: string
+                  format: uuid
+                  description: The Claude CLI session ID to resume.
+                  example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+                prompt:
+                  type: string
+                  description: The prompt message to send.
+                  example: "What files did we edit in the last turn?"
+                cwd:
+                  type: string
+                  description: Working directory for the Claude process. Defaults to server cwd.
+                  example: "/Users/dev/project"
+            example:
+              sessionId: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+              prompt: "Summarize the changes so far."
+      responses:
+        "200":
+          description: Claude response or error
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/ClaudePromptResponse"
+                  - $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                success:
+                  summary: Prompt answered
+                  value:
+                    ok: true
+                    output: "We edited server.ts and index.ts in the last turn."
+                    stderr: ""
+                missingFields:
+                  summary: Missing required fields
+                  value:
+                    ok: false
+                    error: Missing sessionId or prompt
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/BodyTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /continue:
+    post:
+      operationId: continueSession
+      tags: [OneShot]
+      summary: Continue the most recent Claude session
+      description: |
+        Sends a prompt with the `--continue` flag, which resumes the
+        most recently active Claude CLI session. This is a one-shot call.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [prompt]
+              properties:
+                prompt:
+                  type: string
+                  description: The prompt message to send.
+                  example: "Now run the tests."
+                cwd:
+                  type: string
+                  description: Working directory for the Claude process. Defaults to server cwd.
+                  example: "/Users/dev/project"
+            example:
+              prompt: "Now run the tests."
+      responses:
+        "200":
+          description: Claude response or error
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/ClaudePromptResponse"
+                  - $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                success:
+                  summary: Prompt answered
+                  value:
+                    ok: true
+                    output: "All 42 tests passed."
+                    stderr: ""
+                missingPrompt:
+                  summary: Missing prompt
+                  value:
+                    ok: false
+                    error: Missing prompt
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/BodyTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  # ── Sessions (disk-based discovery) ───────────────────────────────────────────
+
+  /sessions:
+    get:
+      operationId: listDiskSessions
+      tags: [Sessions]
+      summary: List past Claude CLI sessions from disk
+      description: |
+        Scans `~/.claude/projects/` for JSONL session files and returns
+        metadata about each session (ID, project path, message count, summary).
+        Results are sorted by last modified time, limited to 50.
+      responses:
+        "200":
+          description: List of discovered sessions
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DiskSessionsResponse"
+              example:
+                ok: true
+                sessions:
+                  - sessionId: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+                    summary: "Fix the login bug in auth.ts"
+                    projectPath: "/Users/dev/project"
+                    modified: "2026-02-21T10:30:00.000Z"
+                    messageCount: 24
+                  - sessionId: "b2c3d4e5-f6a7-8901-bcde-f12345678901"
+                    summary: "Add unit tests for the API"
+                    projectPath: "/Users/dev/api-server"
+                    modified: "2026-02-20T15:00:00.000Z"
+                    messageCount: 12
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  # ── Persistent Sessions ───────────────────────────────────────────────────────
+
+  /session/start:
+    post:
+      operationId: startSession
+      tags: [Persistent]
+      summary: Create a new persistent session
+      description: |
+        Creates a new named in-memory session with the given configuration.
+        The session persists across multiple `/session/send` calls until
+        explicitly stopped or the server restarts.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SessionStartRequest"
+            example:
+              name: "backend-refactor"
+              cwd: "/Users/dev/project"
+              model: "claude-sonnet-4-20250514"
+              permissionMode: "acceptEdits"
+              maxTurns: 20
+              systemPrompt: "You are a senior backend engineer."
+      responses:
+        "200":
+          description: Session created or error
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/SessionStartResponse"
+                  - $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                created:
+                  summary: Session created
+                  value:
+                    ok: true
+                    claudeSessionId: "c3d4e5f6-a7b8-9012-cdef-123456789012"
+                alreadyExists:
+                  summary: Session name taken
+                  value:
+                    ok: false
+                    error: "Session 'backend-refactor' already exists"
+                missingName:
+                  summary: Missing name
+                  value:
+                    ok: false
+                    error: Missing name
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/BodyTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /session/send:
+    post:
+      operationId: sendMessage
+      tags: [Persistent]
+      summary: Send a message to a persistent session
+      description: |
+        Sends a prompt to a named persistent session and waits for the
+        full Claude response (JSON mode). The message and response are
+        recorded in the session history.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, message]
+              properties:
+                name:
+                  type: string
+                  description: Name of the persistent session.
+                  example: "backend-refactor"
+                message:
+                  type: string
+                  description: The prompt to send to Claude.
+                  example: "Refactor the database module to use connection pooling."
+                timeout:
+                  type: integer
+                  description: Timeout in milliseconds for the Claude process. Defaults to 120000.
+                  default: 120000
+                  example: 180000
+            example:
+              name: "backend-refactor"
+              message: "List all files in the src/ directory."
+      responses:
+        "200":
+          description: Claude response or error
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/SessionSendResponse"
+                  - $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                success:
+                  summary: Message sent and answered
+                  value:
+                    ok: true
+                    response: "Here are the files in src/:\n- index.ts\n- server.ts\n- utils.ts"
+                sessionNotFound:
+                  summary: Session not found
+                  value:
+                    ok: false
+                    error: "Session 'nonexistent' not found"
+                sessionPaused:
+                  summary: Session is paused
+                  value:
+                    ok: false
+                    error: "Session 'backend-refactor' is paused"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/BodyTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /session/send-stream:
+    post:
+      operationId: sendMessageStream
+      tags: [Persistent]
+      summary: Send a message to a persistent session (SSE stream)
+      description: |
+        Sends a prompt to a named persistent session and streams the
+        response back as Server-Sent Events (SSE). Events include text
+        deltas, tool usage notifications, tool results, errors, and a
+        final `done` event. The client should read the `text/event-stream`
+        response incrementally.
+
+        ### SSE Event Types
+
+        | `type`        | Description                                    |
+        |---------------|------------------------------------------------|
+        | `text`        | A chunk of assistant text (`text` field).      |
+        | `tool_use`    | Claude invoked a tool (`tool` field).          |
+        | `tool_result` | A tool returned its result.                    |
+        | `error`       | An error occurred (`error` field).             |
+        | `done`        | Stream is complete; close the connection.      |
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, message]
+              properties:
+                name:
+                  type: string
+                  description: Name of the persistent session.
+                  example: "backend-refactor"
+                message:
+                  type: string
+                  description: The prompt to send to Claude.
+                  example: "Write unit tests for the auth module."
+                timeout:
+                  type: integer
+                  description: Timeout in milliseconds. Defaults to 120000.
+                  default: 120000
+                  example: 300000
+            example:
+              name: "backend-refactor"
+              message: "Explain the architecture of this project."
+      responses:
+        "200":
+          description: |
+            Server-Sent Events stream. Each event is a `data:` line containing
+            a JSON object with a `type` field. The stream ends with a `done` event.
+            If the session is not found or is paused, a JSON error is returned instead.
+          content:
+            text/event-stream:
+              schema:
+                $ref: "#/components/schemas/SSEEvent"
+              examples:
+                textDelta:
+                  summary: Text chunk
+                  value: |
+                    data: {"type":"text","text":"Here is the "}
+
+                    data: {"type":"text","text":"architecture overview..."}
+
+                    data: {"type":"done"}
+                toolUse:
+                  summary: Tool invocation
+                  value: |
+                    data: {"type":"tool_use","tool":"Bash"}
+
+                    data: {"type":"tool_result"}
+
+                    data: {"type":"text","text":"The command output shows..."}
+
+                    data: {"type":"done"}
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                ok: false
+                error: "Session 'nonexistent' not found"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "413":
+          $ref: "#/components/responses/BodyTooLarge"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /session/list:
+    get:
+      operationId: listPersistentSessions
+      tags: [Persistent]
+      summary: List active in-memory sessions
+      description: |
+        Returns a list of all currently active persistent sessions with
+        their name, working directory, creation time, and readiness status.
+      responses:
+        "200":
+          description: List of active sessions
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionListResponse"
+              example:
+                ok: true
+                sessions:
+                  - name: "backend-refactor"
+                    cwd: "/Users/dev/project"
+                    created: "2026-02-21T10:00:00.000Z"
+                    isReady: true
+                  - name: "frontend-build"
+                    cwd: "/Users/dev/webapp"
+                    created: "2026-02-21T11:00:00.000Z"
+                    isReady: false
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /session/stop:
+    post:
+      operationId: stopSession
+      tags: [Persistent]
+      summary: Stop and remove a persistent session
+      description: |
+        Kills any active Claude process for the session, removes it from
+        the in-memory store, and frees all resources.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SessionNameRequest"
+            example:
+              name: "backend-refactor"
+      responses:
+        "200":
+          description: Session stopped or error
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/OkResponse"
+                  - $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                stopped:
+                  summary: Session stopped
+                  value:
+                    ok: true
+                notFound:
+                  summary: Session not found
+                  value:
+                    ok: false
+                    error: "Session 'nonexistent' not found"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /session/status:
+    post:
+      operationId: getSessionStatus
+      tags: [Persistent]
+      summary: Get the status and stats of a persistent session
+      description: |
+        Returns detailed status information for a named session, including
+        the Claude session ID, working directory, creation time, turn count,
+        tool call count, token usage, uptime, and readiness state.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SessionNameRequest"
+            example:
+              name: "backend-refactor"
+      responses:
+        "200":
+          description: Session status or error
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/SessionStatusResponse"
+                  - $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                active:
+                  summary: Active session status
+                  value:
+                    ok: true
+                    claudeSessionId: "c3d4e5f6-a7b8-9012-cdef-123456789012"
+                    cwd: "/Users/dev/project"
+                    created: "2026-02-21T10:00:00.000Z"
+                    stats:
+                      turns: 5
+                      toolCalls: 12
+                      tokensIn: 0
+                      tokensOut: 0
+                      uptime: 3600
+                      lastActivity: "2026-02-21T11:00:00.000Z"
+                      isReady: true
+                notFound:
+                  summary: Session not found
+                  value:
+                    ok: false
+                    error: "Session 'nonexistent' not found"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /session/history:
+    post:
+      operationId: getSessionHistory
+      tags: [Persistent]
+      summary: Get the conversation history of a session
+      description: |
+        Returns the most recent messages from the session's conversation
+        history. Each entry includes a timestamp, type (human or assistant),
+        and the message content.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                  description: Name of the persistent session.
+                  example: "backend-refactor"
+                limit:
+                  type: integer
+                  description: Maximum number of history entries to return from the end. Defaults to 20.
+                  default: 20
+                  example: 10
+            example:
+              name: "backend-refactor"
+              limit: 5
+      responses:
+        "200":
+          description: Session history or error
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/SessionHistoryResponse"
+                  - $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                history:
+                  summary: Conversation history
+                  value:
+                    ok: true
+                    count: 10
+                    history:
+                      - time: "2026-02-21T10:05:00.000Z"
+                        type: human
+                        event:
+                          message:
+                            content:
+                              - type: text
+                                text: "List all TypeScript files."
+                      - time: "2026-02-21T10:05:30.000Z"
+                        type: assistant
+                        event:
+                          message:
+                            content:
+                              - type: text
+                                text: "Found 3 TypeScript files in src/."
+                notFound:
+                  summary: Session not found
+                  value:
+                    ok: false
+                    error: "Session 'nonexistent' not found"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  # ── Resume (session lifecycle management) ─────────────────────────────────────
+
+  /session/pause:
+    post:
+      operationId: pauseSession
+      tags: [Resume]
+      summary: Pause a persistent session
+      description: |
+        Pauses the session, preventing new messages from being sent.
+        If a Claude process is currently running, it is killed.
+        The session remains in memory and can be resumed.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SessionNameRequest"
+            example:
+              name: "backend-refactor"
+      responses:
+        "200":
+          description: Session paused or error
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/OkResponse"
+                  - $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                paused:
+                  summary: Session paused
+                  value:
+                    ok: true
+                notFound:
+                  summary: Session not found
+                  value:
+                    ok: false
+                    error: "Session 'nonexistent' not found"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /session/resume:
+    post:
+      operationId: resumePersistentSession
+      tags: [Resume]
+      summary: Resume a paused persistent session
+      description: |
+        Unpauses a previously paused session, allowing new messages
+        to be sent again.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SessionNameRequest"
+            example:
+              name: "backend-refactor"
+      responses:
+        "200":
+          description: Session resumed or error
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/OkResponse"
+                  - $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                resumed:
+                  summary: Session resumed
+                  value:
+                    ok: true
+                notFound:
+                  summary: Session not found
+                  value:
+                    ok: false
+                    error: "Session 'nonexistent' not found"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /session/fork:
+    post:
+      operationId: forkSession
+      tags: [Resume]
+      summary: Fork a persistent session into a new session
+      description: |
+        Creates a new persistent session by copying the configuration and
+        conversation history from an existing session. The forked session
+        gets a new Claude session ID and independent stats.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, newName]
+              properties:
+                name:
+                  type: string
+                  description: Name of the source session to fork from.
+                  example: "backend-refactor"
+                newName:
+                  type: string
+                  description: Name for the new forked session.
+                  example: "backend-refactor-v2"
+            example:
+              name: "backend-refactor"
+              newName: "backend-refactor-experiment"
+      responses:
+        "200":
+          description: Fork result or error
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/SessionStartResponse"
+                  - $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                forked:
+                  summary: Session forked
+                  value:
+                    ok: true
+                    claudeSessionId: "d4e5f6a7-b8c9-0123-defa-234567890123"
+                sourceNotFound:
+                  summary: Source session not found
+                  value:
+                    ok: false
+                    error: "Session 'nonexistent' not found"
+                nameConflict:
+                  summary: New name already taken
+                  value:
+                    ok: false
+                    error: "Session 'backend-refactor-v2' already exists"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /session/search:
+    post:
+      operationId: searchSessions
+      tags: [Resume]
+      summary: Search in-memory sessions
+      description: |
+        Searches active persistent sessions by name/cwd keyword, project
+        path, and/or creation time. Supports relative time filters
+        like "1h", "2d", "30m" or ISO date strings.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                query:
+                  type: string
+                  description: Search keyword to match against session name or working directory.
+                  example: "refactor"
+                project:
+                  type: string
+                  description: Filter by project path substring.
+                  example: "/Users/dev/project"
+                since:
+                  type: string
+                  description: |
+                    Return only sessions created after this time. Accepts relative
+                    durations ("1h", "2d", "30m") or ISO 8601 date strings.
+                  example: "2d"
+                limit:
+                  type: integer
+                  description: Maximum number of results to return. Defaults to 20.
+                  default: 20
+                  example: 10
+            example:
+              query: "backend"
+              since: "1h"
+              limit: 5
+      responses:
+        "200":
+          description: Search results
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionSearchResponse"
+              example:
+                ok: true
+                sessions:
+                  - name: "backend-refactor"
+                    cwd: "/Users/dev/project"
+                    created: "2026-02-21T10:00:00.000Z"
+                    summary: "Refactor the database module"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /session/restart:
+    post:
+      operationId: restartSession
+      tags: [Resume]
+      summary: Restart a persistent session with a fresh Claude session
+      description: |
+        Kills any active process, assigns a new Claude session ID, resets
+        stats, and clears conversation history. The session configuration
+        (name, cwd, model, permissions, etc.) is preserved.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SessionNameRequest"
+            example:
+              name: "backend-refactor"
+      responses:
+        "200":
+          description: Session restarted or error
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/OkResponse"
+                  - $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                restarted:
+                  summary: Session restarted
+                  value:
+                    ok: true
+                notFound:
+                  summary: Session not found
+                  value:
+                    ok: false
+                    error: "Session 'nonexistent' not found"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Components
+# ═══════════════════════════════════════════════════════════════════════════════
+
+components:
+
+  # ── Reusable Schemas ────────────────────────────────────────────────────────
+
+  schemas:
+
+    # ── Shared field types ──────────────────────────────────────────────────
+
+    OkResponse:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+          description: Whether the operation succeeded.
+          example: true
+      description: A minimal success response.
+
+    ErrorResponse:
+      type: object
+      required: [ok, error]
+      properties:
+        ok:
+          type: boolean
+          description: Always `false` for error responses.
+          example: false
+        error:
+          type: string
+          description: Human-readable error message.
+          example: "Session 'demo' not found"
+      description: A standard error envelope returned on failure.
+
+    # ── Tool definitions ────────────────────────────────────────────────────
+
+    ToolDefinition:
+      type: object
+      required: [name, description]
+      properties:
+        name:
+          type: string
+          description: The tool identifier as recognized by Claude CLI.
+          example: Bash
+        description:
+          type: string
+          description: Short human-readable description of the tool.
+          example: Execute bash commands
+      description: A known Claude CLI tool descriptor.
+
+    # ── History entry ───────────────────────────────────────────────────────
+
+    HistoryEntry:
+      type: object
+      required: [time, type, event]
+      properties:
+        time:
+          type: string
+          format: date-time
+          description: ISO 8601 timestamp of the message.
+          example: "2026-02-21T10:05:00.000Z"
+        type:
+          type: string
+          enum: [human, assistant]
+          description: Whether this entry is from the user or the assistant.
+          example: human
+        event:
+          type: object
+          description: Event payload containing the message.
+          properties:
+            message:
+              type: object
+              properties:
+                content:
+                  type: array
+                  description: Array of content blocks.
+                  items:
+                    $ref: "#/components/schemas/ContentBlock"
+      description: A single entry in a session's conversation history.
+
+    ContentBlock:
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+          description: The type of content block.
+          enum: [text, tool_use]
+          example: text
+        text:
+          type: string
+          description: Text content (present when type is "text").
+          example: "List all TypeScript files."
+        name:
+          type: string
+          description: Tool name (present when type is "tool_use").
+          example: Bash
+      description: A content block within a message (text or tool use).
+
+    # ── Session configuration (for start) ───────────────────────────────────
+
+    SessionStartRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          description: Unique name for the session.
+          example: "backend-refactor"
+        cwd:
+          type: string
+          description: Working directory for Claude processes in this session.
+          example: "/Users/dev/project"
+        customSessionId:
+          type: string
+          format: uuid
+          description: Provide a specific Claude session ID instead of generating one.
+          example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        sessionId:
+          type: string
+          format: uuid
+          description: Alias for customSessionId (legacy).
+        model:
+          type: string
+          description: Claude model to use (e.g., claude-sonnet-4-20250514).
+          example: "claude-sonnet-4-20250514"
+        baseUrl:
+          type: string
+          format: uri
+          description: Custom API base URL.
+          example: "https://api.anthropic.com"
+        permissionMode:
+          type: string
+          description: Permission mode for tool execution.
+          default: acceptEdits
+          enum: [acceptEdits, bypassPermissions, plan]
+          example: "acceptEdits"
+        allowedTools:
+          type: array
+          items:
+            type: string
+          description: Allowlist of tool names.
+          example: ["Bash", "Read", "Write"]
+        disallowedTools:
+          type: array
+          items:
+            type: string
+          description: Blocklist of tool names.
+          example: ["WebFetch"]
+        tools:
+          type: array
+          items:
+            type: string
+          description: Explicit list of tools to make available.
+        maxTurns:
+          type: integer
+          description: Maximum number of agentic turns per prompt.
+          example: 20
+        maxBudgetUsd:
+          type: number
+          format: float
+          description: Maximum budget in USD for this session.
+          example: 5.0
+        systemPrompt:
+          type: string
+          description: Override the system prompt entirely.
+          example: "You are a senior backend engineer. Be concise."
+        appendSystemPrompt:
+          type: string
+          description: Text to append to the default system prompt.
+          example: "Always explain your reasoning step by step."
+        dangerouslySkipPermissions:
+          type: boolean
+          description: Skip all permission checks. Use with extreme caution.
+          default: false
+          example: false
+        agents:
+          type: object
+          description: Named sub-agent definitions.
+          additionalProperties:
+            type: object
+            properties:
+              description:
+                type: string
+                description: Description of the agent's role.
+              prompt:
+                type: string
+                description: System prompt for the agent.
+        agent:
+          type: string
+          description: Name of the agent to activate.
+          example: "reviewer"
+        addDir:
+          type: array
+          items:
+            type: string
+          description: Additional directories to include in the Claude context.
+          example: ["/Users/dev/shared-lib"]
+      description: Configuration for creating a new persistent session.
+
+    SessionStartResponse:
+      type: object
+      required: [ok, claudeSessionId]
+      properties:
+        ok:
+          type: boolean
+          example: true
+        claudeSessionId:
+          type: string
+          format: uuid
+          description: The Claude CLI session ID assigned to this session.
+          example: "c3d4e5f6-a7b8-9012-cdef-123456789012"
+      description: Returned when a session is successfully created or forked.
+
+    # ── Session info (list item) ────────────────────────────────────────────
+
+    SessionInfo:
+      type: object
+      required: [name, cwd, created, isReady]
+      properties:
+        name:
+          type: string
+          description: Session name.
+          example: "backend-refactor"
+        cwd:
+          type: string
+          description: Working directory.
+          example: "/Users/dev/project"
+        created:
+          type: string
+          format: date-time
+          description: ISO 8601 creation timestamp.
+          example: "2026-02-21T10:00:00.000Z"
+        isReady:
+          type: boolean
+          description: Whether the session is unpaused and has no active process.
+          example: true
+      description: Summary of an active persistent session.
+
+    # ── Session status ──────────────────────────────────────────────────────
+
+    SessionStatus:
+      type: object
+      required: [turns, toolCalls, tokensIn, tokensOut, uptime, lastActivity, isReady]
+      properties:
+        turns:
+          type: integer
+          description: Total number of agentic turns completed.
+          example: 5
+        toolCalls:
+          type: integer
+          description: Total number of tool invocations.
+          example: 12
+        tokensIn:
+          type: integer
+          description: Total input tokens consumed (may be 0 if not tracked).
+          example: 0
+        tokensOut:
+          type: integer
+          description: Total output tokens generated (may be 0 if not tracked).
+          example: 0
+        uptime:
+          type: integer
+          description: Session uptime in seconds since creation.
+          example: 3600
+        lastActivity:
+          type: string
+          format: date-time
+          description: ISO 8601 timestamp of the last activity.
+          example: "2026-02-21T11:00:00.000Z"
+        isReady:
+          type: boolean
+          description: Whether the session is ready to accept new messages.
+          example: true
+      description: Runtime statistics for a persistent session.
+
+    # ── SSE event ───────────────────────────────────────────────────────────
+
+    SSEEvent:
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+          description: The event type.
+          enum: [text, tool_use, tool_result, error, done]
+          example: text
+        text:
+          type: string
+          description: Text content (present when type is "text").
+          example: "Here is the code..."
+        tool:
+          type: string
+          description: Tool name (present when type is "tool_use").
+          example: Bash
+        error:
+          type: string
+          description: Error message (present when type is "error").
+          example: "Process timed out"
+      description: |
+        A single Server-Sent Event payload. Streamed as `data: <json>\n\n`.
+
+    # ── Claude result from CLI ──────────────────────────────────────────────
+
+    ClaudeResult:
+      type: object
+      properties:
+        type:
+          type: string
+          description: Result type from the Claude CLI.
+          example: result
+        subtype:
+          type: string
+          description: Result subtype.
+        result:
+          type: string
+          description: The final text result from Claude.
+          example: "The file has been updated successfully."
+        session_id:
+          type: string
+          format: uuid
+          description: The Claude session ID used.
+          example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        cost_usd:
+          type: number
+          format: float
+          description: Cost of the request in USD.
+          example: 0.03
+        num_turns:
+          type: integer
+          description: Number of agentic turns used.
+          example: 3
+        is_error:
+          type: boolean
+          description: Whether the result represents an error.
+          example: false
+        duration_ms:
+          type: integer
+          description: Duration of the request in milliseconds.
+          example: 4500
+      description: |
+        The parsed JSON output from the Claude CLI process when run
+        with `--output-format json`.
+
+    # ── Disk session (from /sessions) ───────────────────────────────────────
+
+    DiskSession:
+      type: object
+      required: [sessionId]
+      properties:
+        sessionId:
+          type: string
+          description: The Claude CLI session ID from the JSONL filename.
+          example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        summary:
+          type: string
+          description: First user message (up to 100 chars) as a summary.
+          example: "Fix the login bug in auth.ts"
+        projectPath:
+          type: string
+          description: Decoded project path from the directory name.
+          example: "/Users/dev/project"
+        modified:
+          type: string
+          format: date-time
+          description: Last modification time of the JSONL file.
+          example: "2026-02-21T10:30:00.000Z"
+        messageCount:
+          type: integer
+          description: Number of JSONL lines (messages) in the session file.
+          example: 24
+      description: A past Claude CLI session discovered on disk.
+
+    # ── Session name request body ───────────────────────────────────────────
+
+    SessionNameRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          description: Name of the persistent session.
+          example: "backend-refactor"
+      description: Request body that identifies a session by name.
+
+    # ── Composite response schemas ──────────────────────────────────────────
+
+    ConnectSuccessResponse:
+      type: object
+      required: [ok, status, server, tools]
+      properties:
+        ok:
+          type: boolean
+          example: true
+        status:
+          type: string
+          description: Connection status string.
+          example: connected
+        server:
+          type: object
+          required: [name, version, bin]
+          properties:
+            name:
+              type: string
+              description: Server identifier.
+              example: claude-code-backend
+            version:
+              type: string
+              description: Server version.
+              example: "1.0.0"
+            bin:
+              type: string
+              description: Resolved path to the Claude CLI binary.
+              example: "/Users/dev/.local/bin/claude"
+        tools:
+          type: integer
+          description: Number of known tools.
+          example: 13
+      description: Returned on successful connection.
+
+    ToolsResponse:
+      type: object
+      required: [ok, tools]
+      properties:
+        ok:
+          type: boolean
+          example: true
+        tools:
+          type: array
+          items:
+            $ref: "#/components/schemas/ToolDefinition"
+      description: List of available Claude CLI tools.
+
+    BashResponse:
+      type: object
+      required: [ok, result]
+      properties:
+        ok:
+          type: boolean
+          example: true
+        result:
+          type: object
+          required: [stdout, stderr]
+          properties:
+            stdout:
+              type: string
+              description: Standard output from the command.
+              example: "M  src/server.ts\n"
+            stderr:
+              type: string
+              description: Standard error from the command.
+              example: ""
+      description: Result of a bash command execution.
+
+    ReadResponse:
+      type: object
+      required: [ok, result]
+      properties:
+        ok:
+          type: boolean
+          example: true
+        result:
+          type: object
+          required: [type, file]
+          properties:
+            type:
+              type: string
+              description: Always "file".
+              example: file
+            file:
+              type: object
+              required: [content]
+              properties:
+                content:
+                  type: string
+                  description: Full UTF-8 content of the file.
+                  example: "# README\n\nHello world.\n"
+      description: Contents of a file read from disk.
+
+    CallResponse:
+      type: object
+      required: [ok, result]
+      properties:
+        ok:
+          type: boolean
+          example: true
+        result:
+          description: |
+            The tool output. May be a string, object, or array depending
+            on the tool invoked.
+          oneOf:
+            - type: string
+            - type: object
+              additionalProperties: true
+            - type: array
+              items: {}
+      description: Result from invoking a Claude tool.
+
+    BatchReadResponse:
+      type: object
+      required: [ok, files]
+      properties:
+        ok:
+          type: boolean
+          example: true
+        files:
+          type: array
+          items:
+            type: object
+            required: [path, content]
+            properties:
+              path:
+                type: string
+                description: Absolute path to the file.
+                example: "/Users/dev/project/src/index.ts"
+              content:
+                type: string
+                description: UTF-8 content of the file (empty string on error).
+                example: "console.log('hello');\n"
+              error:
+                type: string
+                description: Error message if the file could not be read.
+                example: "EACCES: permission denied"
+      description: Results of reading multiple files by glob pattern.
+
+    ClaudePromptResponse:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+          example: true
+        output:
+          type: string
+          description: The text result from Claude.
+          example: "All 42 tests passed successfully."
+        stderr:
+          type: string
+          description: Any stderr output from the Claude process.
+          example: ""
+      description: Response from a one-shot Claude prompt (resume/continue).
+
+    SessionSendResponse:
+      type: object
+      required: [ok, response]
+      properties:
+        ok:
+          type: boolean
+          example: true
+        response:
+          type: string
+          description: The full text response from Claude.
+          example: "I have refactored the database module to use connection pooling."
+      description: Response from sending a message to a persistent session.
+
+    SessionListResponse:
+      type: object
+      required: [ok, sessions]
+      properties:
+        ok:
+          type: boolean
+          example: true
+        sessions:
+          type: array
+          items:
+            $ref: "#/components/schemas/SessionInfo"
+      description: List of active in-memory sessions.
+
+    SessionStatusResponse:
+      type: object
+      required: [ok, claudeSessionId, cwd, created, stats]
+      properties:
+        ok:
+          type: boolean
+          example: true
+        claudeSessionId:
+          type: string
+          format: uuid
+          description: The Claude CLI session ID.
+          example: "c3d4e5f6-a7b8-9012-cdef-123456789012"
+        cwd:
+          type: string
+          description: Working directory.
+          example: "/Users/dev/project"
+        created:
+          type: string
+          format: date-time
+          description: When the session was created.
+          example: "2026-02-21T10:00:00.000Z"
+        stats:
+          $ref: "#/components/schemas/SessionStatus"
+      description: Detailed status of a persistent session.
+
+    SessionHistoryResponse:
+      type: object
+      required: [ok, count, history]
+      properties:
+        ok:
+          type: boolean
+          example: true
+        count:
+          type: integer
+          description: Total number of history entries in the session.
+          example: 10
+        history:
+          type: array
+          items:
+            $ref: "#/components/schemas/HistoryEntry"
+      description: Conversation history for a session.
+
+    DiskSessionsResponse:
+      type: object
+      required: [ok, sessions]
+      properties:
+        ok:
+          type: boolean
+          example: true
+        sessions:
+          type: array
+          items:
+            $ref: "#/components/schemas/DiskSession"
+      description: List of past Claude CLI sessions found on disk.
+
+    SessionSearchResponse:
+      type: object
+      required: [ok, sessions]
+      properties:
+        ok:
+          type: boolean
+          example: true
+        sessions:
+          type: array
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+                description: Session name.
+                example: "backend-refactor"
+              cwd:
+                type: string
+                description: Working directory.
+                example: "/Users/dev/project"
+              created:
+                type: string
+                format: date-time
+                description: Creation timestamp.
+                example: "2026-02-21T10:00:00.000Z"
+              summary:
+                type: string
+                description: Last user message summary (up to 100 chars).
+                example: "Refactor the database module"
+      description: Search results from in-memory sessions.
+
+  # ── Reusable Responses ──────────────────────────────────────────────────────
+
+  responses:
+    BadRequest:
+      description: Malformed JSON in request body.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            ok: false
+            error: "Malformed JSON in request body: Unexpected token } in JSON at position 42"
+
+    BodyTooLarge:
+      description: Request body exceeds the 10 MB limit.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            ok: false
+            error: "Request body too large: 10485761 bytes exceeds 10485760 byte limit"
+
+    NotFound:
+      description: Unknown endpoint.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            ok: false
+            error: "Unknown endpoint: /nonexistent"
+
+    MethodNotAllowed:
+      description: Wrong HTTP method for the endpoint.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            ok: false
+            error: "Method GET not allowed"
+
+    InternalError:
+      description: Unexpected server error.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            ok: false
+            error: "Internal server error"

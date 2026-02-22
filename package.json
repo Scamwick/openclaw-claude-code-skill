@@ -12,7 +12,9 @@
     "build": "tsc",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
-    "start:server": "node dist/server.js"
+    "start:server": "node dist/server.js",
+    "test": "node --test --import tsx tests/server.test.ts",
+    "test:live": "LIVE_TEST=1 node --test --import tsx tests/server.test.ts"
   },
   "engines": {
     "node": ">=18.0.0"
